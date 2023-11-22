@@ -1,0 +1,23 @@
+# ParaCrawl bilingual training configuration
+# This configuration expects -s and -t command line options to specify the source and target language
+data_dir: data/ParaCrawl                      # directory containing the training and validation data (obtained with download-paracrawl.sh)
+tokenizer_path: "{pair}/bpecodes"             # path to the BPE model relative to 'data_dir', '{pair}' is a placeholder whose value depends on '-s' and '-t' (e.g., "-s de -t en" -> 'de-en'); a different target BPE model can be defined as "target_tokenizer_path"
+dict: "{pair}/dict.txt"                       # path to the dictionary relative to 'data_dir', a different target dict can be defined as "target_dict"
+model_dir: models/ParaCrawl/{pair}.big.6-6    # directory where the model checkpoints will be saved
+arch: transformer_big                         # architecture of the model (e.g., transformer, adapter_transformer, etc.)
+dropout: 0.1                                  # dropout rate in the Transformer
+label_smoothing: 0.1                          # label smoothing amount, set to 0 for regular cross entropy
+batch_size: 8192                              # maximum number of tokens in a batch
+virtual_dp_size: 32                           # accumulate gradients over this many batches before updating the model parameters, this is normalized by the number of GPUs
+init_lr: 1.0e-07                              # learning rate at the beginning of warmup
+lr: 0.001                                     # maximum learning rate after warmup
+adam_betas: [0.9, 0.98]                       # parameters of the Adam optimizer
+max_steps: 120000                             # maximum number of training updates
+save_interval: 1000                           # save a checkpoint every N updates
+valid_interval: 1000                          # evaluate the model every N updates
+patience: 5                                   # stop training if the validation score has not improved in the last N evaluations
+
+train_corpora:                                # training corpora definition:
+  - paths: ['ParaCrawl.{pair}']               # looks for ParaCrawl.{src}-{tgt}.{src} and ParaCrawl.{src}-{tgt}.{tgt} files, where {src} and {tgt} are the languages defined with -s/--source-langs and -t/--target-langs (or --lang-pairs)
+valid_corpora:                                # validation corpora definition:
+  - paths: ['data/FLORES/FLORES-valid']       # looks for FLORES-valid.{src} and FLORES-valid.{tgt} files

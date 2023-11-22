@@ -1,0 +1,29 @@
+# ParaCrawl 26-language English-centric configuration
+data_dir: data/ParaCrawl-Euro         # path to the data obtained with download.sh
+tokenizer_path: "bpecodes"            # shared multilingual BPE model
+dict: "dict.txt"                      # shared multilingual dictionary
+arch: transformer_wide                # same as Transformer Big, but with twice larger FFN blocks (302M paramerers excluding embeddings)
+encoder_layers: 12                    # deep encoder /
+decoder_layers: 2                     # shallow decoder (faster at inference than 6-6 models)
+dropout: 0.1
+label_smoothing: 0.1
+batch_size: 8192                      # large batch size, can cause memory issues (if OOMs, set to batch_size: 4096, virtual_dp_size: 64)
+virtual_dp_size: 32
+init_lr: 1.0e-07
+lr: 0.001                             # large learning rate, set to 0.0005 if it overflows
+adam_betas: [0.9, 0.98]
+valid_interval: 5000
+keep_interval: 20000
+max_steps: 1000000                    # ~2 weeks on 4 A100s
+lang_temperature: 5                   # language-pair sampling temperature (default value is 1); with T=5, German-English is only sampled 3x as often as Maltese-English, while it has 200x as much data
+lang_code: True                       # prepend a target language code to the source sentences
+
+train_corpora:   # English-centric training on 50 directions
+  - paths: ['bilingual/ParaCrawl.{pair}']
+    source_langs: [fr, de, es, it, pt, nl, nb, cs, pl, sv, da, el, fi, hr, hu, bg, ro, sk, lt, lv, sl, et, ga, is, mt]
+    target_langs: [en]
+    bidir: true  # this includes all defined language pairs in both directions
+valid_corpora:   # to speed-up validation: 100 samples per language pair concatenated into per-target language valid sets
+  - paths: ['data/FLORES/euro/FLORES-valid']
+    source_langs: [src]
+    target_langs: [en, fr, de, es, it, pt, nl, nb, cs, pl, sv, da, el, fi, hr, hu, bg, ro, sk, lt, lv, sl, et, ga, is, mt]

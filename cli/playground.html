@@ -1,0 +1,458 @@
+<!-- 
+Pasero Copyright (c) 2023-present NAVER Corporation
+Please refer to the license file provided in the project.
+-->
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Pasero Playground</title>
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/themes/prism.min.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-json.min.js"></script>
+  <script>
+    var model_name = decodeURIComponent($(location).attr('pathname').split('/').pop());
+    const languages = {'ace_Arab': 'Acehnese (Arabic script)', 'ace_Latn': 'Acehnese (Latin script)', 'acm_Arab': 'Mesopotamian Arabic', 'acq_Arab': 'Ta’izzi-Adeni Arabic', 'aeb_Arab': 'Tunisian Arabic', 'afr_Latn': 'Afrikaans', 'afr': 'Afrikaans', 'af': 'Afrikaans', 'ajp_Arab': 'South Levantine Arabic', 'aka_Latn': 'Akan', 'amh_Ethi': 'Amharic', 'amh': 'Amharic', 'am': 'Amharic', 'apc_Arab': 'North Levantine Arabic', 'arb_Arab': 'Arabic', 'ara': 'Arabic', 'ar': 'Arabic', 'arb_Latn': 'Arabic (Romanized)', 'ars_Arab': 'Najdi Arabic', 'ary_Arab': 'Moroccan Arabic', 'arz_Arab': 'Egyptian Arabic', 'asm_Beng': 'Assamese', 'asm': 'Assamese', 'ast_Latn': 'Asturian', 'ast': 'Asturian', 'awa_Deva': 'Awadhi', 'ayr_Latn': 'Central Aymara', 'azb_Arab': 'South Azerbaijani', 'azj_Latn': 'North Azerbaijani', 'azj': 'North Azerbaijani', 'az': 'North Azerbaijani', 'bak_Cyrl': 'Bashkir', 'ba': 'Bashkir', 'bam_Latn': 'Bambara', 'ban_Latn': 'Balinese', 'bel_Cyrl': 'Belarusian', 'bel': 'Belarusian', 'be': 'Belarusian', 'bem_Latn': 'Bemba', 'ben_Beng': 'Bengali', 'ben': 'Bengali', 'bn': 'Bengali', 'bho_Deva': 'Bhojpuri', 'bjn_Arab': 'Banjar (Arabic script)', 'bjn_Latn': 'Banjar (Latin script)', 'bod_Tibt': 'Tibetan', 'bos_Latn': 'Bosnian', 'bos': 'Bosnian', 'bs': 'Bosnian', 'bug_Latn': 'Buginese', 'bul_Cyrl': 'Bulgarian', 'bul': 'Bulgarian', 'bg': 'Bulgarian', 'cat_Latn': 'Catalan', 'cat': 'Catalan', 'ca': 'Catalan', 'ceb_Latn': 'Cebuano', 'ceb': 'Cebuano', 'ces_Latn': 'Czech', 'ces': 'Czech', 'cs': 'Czech', 'cjk_Latn': 'Chokwe', 'ckb_Arab': 'Central Kurdish', 'ckb': 'Central Kurdish', 'crh_Latn': 'Crimean Tatar', 'cym_Latn': 'Welsh', 'cym': 'Welsh', 'cy': 'Welsh', 'dan_Latn': 'Danish', 'dan': 'Danish', 'da': 'Danish', 'deu_Latn': 'German', 'deu': 'German', 'de': 'German', 'dik_Latn': 'Southwestern Dinka', 'dyu_Latn': 'Dyula', 'dzo_Tibt': 'Dzongkha', 'ell_Grek': 'Greek', 'ell': 'Greek', 'el': 'Greek', 'eng_Latn': 'English', 'eng': 'English', 'en': 'English', 'epo_Latn': 'Esperanto', 'est_Latn': 'Estonian', 'est': 'Estonian', 'et': 'Estonian', 'eus_Latn': 'Basque', 'eu': 'Basque', 'ewe_Latn': 'Ewe', 'fao_Latn': 'Faroese', 'fij_Latn': 'Fijian', 'fin_Latn': 'Finnish', 'fin': 'Finnish', 'fi': 'Finnish', 'fon_Latn': 'Fon', 'fra_Latn': 'French', 'fra': 'French', 'fr': 'French', 'fur_Latn': 'Friulian', 'fuv_Latn': 'Fulah', 'ful': 'Fulah', 'ff': 'Fulah', 'gla_Latn': 'Scottish Gaelic', 'gd': 'Scottish Gaelic', 'gle_Latn': 'Irish', 'gle': 'Irish', 'ga': 'Irish', 'glg_Latn': 'Galician', 'glg': 'Galician', 'gl': 'Galician', 'grn_Latn': 'Guarani', 'guj_Gujr': 'Gujarati', 'guj': 'Gujarati', 'gu': 'Gujarati', 'hat_Latn': 'Haitian Creole', 'ht': 'Haitian Creole', 'hau_Latn': 'Hausa', 'hau': 'Hausa', 'ha': 'Hausa', 'heb_Hebr': 'Hebrew', 'heb': 'Hebrew', 'he': 'Hebrew', 'hin_Deva': 'Hindi', 'hin': 'Hindi', 'hi': 'Hindi', 'hne_Deva': 'Chhattisgarhi', 'hrv_Latn': 'Croatian', 'hrv': 'Croatian', 'hr': 'Croatian', 'hun_Latn': 'Hungarian', 'hun': 'Hungarian', 'hu': 'Hungarian', 'hye_Armn': 'Armenian', 'hye': 'Armenian', 'hy': 'Armenian', 'ibo_Latn': 'Igbo', 'ibo': 'Igbo', 'ig': 'Igbo', 'ilo_Latn': 'Ilocano', 'ilo': 'Ilocano', 'ind_Latn': 'Indonesian', 'ind': 'Indonesian', 'id': 'Indonesian', 'isl_Latn': 'Icelandic', 'isl': 'Icelandic', 'is': 'Icelandic', 'ita_Latn': 'Italian', 'ita': 'Italian', 'it': 'Italian', 'jav_Latn': 'Javanese', 'jav': 'Javanese', 'jv': 'Javanese', 'jpn_Jpan': 'Japanese', 'jpn': 'Japanese', 'ja': 'Japanese', 'kab_Latn': 'Kabyle', 'kac_Latn': 'Jingpho', 'kam_Latn': 'Kamba', 'kam': 'Kamba', 'kan_Knda': 'Kannada', 'kan': 'Kannada', 'kn': 'Kannada', 'kas_Arab': 'Kashmiri (Arabic script)', 'kas_Deva': 'Kashmiri (Devanagari script)', 'kat_Geor': 'Georgian', 'kat': 'Georgian', 'ka': 'Georgian', 'knc_Arab': 'Central Kanuri (Arabic script)', 'knc_Latn': 'Central Kanuri (Latin script)', 'kaz_Cyrl': 'Kazakh', 'kaz': 'Kazakh', 'kk': 'Kazakh', 'kbp_Latn': 'Kabiyè', 'kea_Latn': 'Kabuverdianu', 'kea': 'Kabuverdianu', 'khm_Khmr': 'Khmer', 'khm': 'Khmer', 'km': 'Khmer', 'kik_Latn': 'Kikuyu', 'kin_Latn': 'Kinyarwanda', 'kir_Cyrl': 'Kyrgyz', 'kir': 'Kyrgyz', 'kmb_Latn': 'Kimbundu', 'kmr_Latn': 'Northern Kurdish', 'kon_Latn': 'Kikongo', 'kor_Hang': 'Korean', 'kor': 'Korean', 'ko': 'Korean', 'lao_Laoo': 'Lao', 'lao': 'Lao', 'lo': 'Lao', 'lij_Latn': 'Ligurian', 'lim_Latn': 'Limburgish', 'lin_Latn': 'Lingala', 'lin': 'Lingala', 'ln': 'Lingala', 'lit_Latn': 'Lithuanian', 'lit': 'Lithuanian', 'lt': 'Lithuanian', 'lmo_Latn': 'Lombard', 'ltg_Latn': 'Latgalian', 'ltz_Latn': 'Luxembourgish', 'ltz': 'Luxembourgish', 'lb': 'Luxembourgish', 'lua_Latn': 'Luba-Kasai', 'lug_Latn': 'Ganda', 'lug': 'Ganda', 'lg': 'Ganda', 'luo_Latn': 'Luo', 'luo': 'Luo', 'lus_Latn': 'Mizo', 'lvs_Latn': 'Latvian', 'lav': 'Latvian', 'lv': 'Latvian', 'mag_Deva': 'Magahi', 'mai_Deva': 'Maithili', 'mal_Mlym': 'Malayalam', 'mal': 'Malayalam', 'ml': 'Malayalam', 'mar_Deva': 'Marathi', 'mar': 'Marathi', 'mr': 'Marathi', 'min_Arab': 'Minangkabau (Arabic script)', 'min_Latn': 'Minangkabau (Latin script)', 'mkd_Cyrl': 'Macedonian', 'mkd': 'Macedonian', 'mk': 'Macedonian', 'plt_Latn': 'Malagasy', 'mg': 'Malagasy', 'mlt_Latn': 'Maltese', 'mlt': 'Maltese', 'mt': 'Maltese', 'mni_Beng': 'Meitei (Bengali script)', 'khk_Cyrl': 'Mongolian', 'mon': 'Mongolian', 'mn': 'Mongolian', 'mos_Latn': 'Mossi', 'mri_Latn': 'Maori', 'mri': 'Maori', 'mya_Mymr': 'Burmese', 'mya': 'Burmese', 'my': 'Burmese', 'nld_Latn': 'Dutch', 'nld': 'Dutch', 'nl': 'Dutch', 'nno_Latn': 'Norwegian Nynorsk', 'nob_Latn': 'Norwegian', 'nob': 'Norwegian', 'nb': 'Norwegian', 'no': 'Norwegian', 'npi_Deva': 'Nepali', 'npi': 'Nepali', 'ne': 'Nepali', 'nso_Latn': 'Northern Sotho', 'nso': 'Northern Sotho', 'ns': 'Northern Sotho', 'nus_Latn': 'Nuer', 'nya_Latn': 'Nyanja', 'nya': 'Nyanja', 'oci_Latn': 'Occitan', 'oci': 'Occitan', 'oc': 'Occitan', 'gaz_Latn': 'West Central Oromo', 'orm': 'West Central Oromo', 'ory_Orya': 'Odia', 'ory': 'Odia', 'or': 'Odia', 'pag_Latn': 'Pangasinan', 'pan_Guru': 'Panjabi', 'pan': 'Panjabi', 'pa': 'Panjabi', 'pap_Latn': 'Papiamento', 'pes_Arab': 'Farsi', 'fas': 'Farsi', 'fa': 'Farsi', 'pol_Latn': 'Polish', 'pol': 'Polish', 'pl': 'Polish', 'por_Latn': 'Portuguese', 'por': 'Portuguese', 'pt': 'Portuguese', 'prs_Arab': 'Dari', 'pbt_Arab': 'Pashto', 'pus': 'Pashto', 'ps': 'Pashto', 'quy_Latn': 'Ayacucho Quechua', 'ron_Latn': 'Romanian', 'ron': 'Romanian', 'ro': 'Romanian', 'run_Latn': 'Rundi', 'rus_Cyrl': 'Russian', 'rus': 'Russian', 'ru': 'Russian', 'sag_Latn': 'Sango', 'san_Deva': 'Sanskrit', 'sat_Beng': 'Santali', 'scn_Latn': 'Sicilian', 'shn_Mymr': 'Shan', 'sin_Sinh': 'Sinhala', 'si': 'Sinhala', 'slk_Latn': 'Slovak', 'slk': 'Slovak', 'sk': 'Slovak', 'slv_Latn': 'Slovenian', 'slv': 'Slovenian', 'sl': 'Slovenian', 'smo_Latn': 'Samoan', 'sna_Latn': 'Shona', 'sna': 'Shona', 'snd_Arab': 'Sindhi', 'snd': 'Sindhi', 'sd': 'Sindhi', 'som_Latn': 'Somali', 'som': 'Somali', 'so': 'Somali', 'sot_Latn': 'Southern Sotho', 'spa_Latn': 'Spanish', 'spa': 'Spanish', 'es': 'Spanish', 'als_Latn': 'Albanian', 'sq': 'Albanian', 'srd_Latn': 'Sardinian', 'srp_Cyrl': 'Serbian', 'srp': 'Serbian', 'sr': 'Serbian', 'ssw_Latn': 'Swati', 'ss': 'Swati', 'sun_Latn': 'Sundanese', 'su': 'Sundanese', 'swe_Latn': 'Swedish', 'swe': 'Swedish', 'sv': 'Swedish', 'swh_Latn': 'Swahili', 'swh': 'Swahili', 'sw': 'Swahili', 'szl_Latn': 'Silesian', 'tam_Taml': 'Tamil', 'tam': 'Tamil', 'ta': 'Tamil', 'tat_Cyrl': 'Tatar', 'tel_Telu': 'Telugu', 'tel': 'Telugu', 'tgk_Cyrl': 'Tajik', 'tgk': 'Tajik', 'tgl_Latn': 'Tagalog', 'tgl': 'Tagalog', 'tl': 'Tagalog', 'tha_Thai': 'Thai', 'tha': 'Thai', 'th': 'Thai', 'tir_Ethi': 'Tigrinya', 'taq_Latn': 'Tamasheq (Latin script)', 'taq_Tfng': 'Tamasheq (Tifinagh script)', 'tpi_Latn': 'Tok Pisin', 'tsn_Latn': 'Tswana', 'tn': 'Tswana', 'tso_Latn': 'Tsonga', 'tuk_Latn': 'Turkmen', 'tum_Latn': 'Tumbuka', 'tur_Latn': 'Turkish', 'tur': 'Turkish', 'tr': 'Turkish', 'twi_Latn': 'Twi', 'tzm_Tfng': 'Central Atlas Tamazight', 'uig_Arab': 'Uyghur', 'ukr_Cyrl': 'Ukrainian', 'ukr': 'Ukrainian', 'uk': 'Ukrainian', 'umb_Latn': 'Umbundu', 'umb': 'Umbundu', 'urd_Arab': 'Urdu', 'urd': 'Urdu', 'ur': 'Urdu', 'uzn_Latn': 'Uzbek', 'uzb': 'Uzbek', 'uz': 'Uzbek', 'vec_Latn': 'Venetian', 'vie_Latn': 'Vietnamese', 'vie': 'Vietnamese', 'vi': 'Vietnamese', 'war_Latn': 'Waray', 'wol_Latn': 'Wolof', 'wol': 'Wolof', 'wo': 'Wolof', 'xho_Latn': 'Xhosa', 'xho': 'Xhosa', 'xh': 'Xhosa', 'ydd_Hebr': 'Yiddish', 'yi': 'Yiddish', 'yor_Latn': 'Yoruba', 'yor': 'Yoruba', 'yo': 'Yoruba', 'yue_Hant': 'Yue Chinese', 'zho_Hans': 'Chinese', 'zho_simpl': 'Chinese', 'zh': 'Chinese', 'zho_Hant': 'Chinese (Traditional)', 'zho_trad': 'Chinese (Traditional)', 'zsm_Latn': 'Malay', 'msa': 'Malay', 'ms': 'Malay', 'zul_Latn': 'Zulu', 'zul': 'Zulu', 'zu': 'Zulu', 'br': 'Breton', 'fy': 'Western Frisian'};
+    var tokens = [];
+    var scores = [];
+    var prompt_tokens = [];
+    var model_info = {};
+    var decoding_options = {};
+    var cur_input = null;
+    var ongoing = false;
+    var source = null;
+    var elapsed = 0;
+
+    $(function () {
+
+      function set_langs(el, langs, default_lang) {
+        if (!langs || langs.length <= 1) {
+          el.parent().hide();
+          return;
+        }
+
+        for (const lang_code of langs) {
+          el.append(new Option(languages[lang_code], lang_code));
+        }
+        el.prop('hidden', false);
+
+        if (langs.includes(default_lang)) {
+          el.val(default_lang);
+        }
+      }
+      
+      $.ajax({
+        type: "POST",
+        url: '/' + model_name + '/info',
+        success: function(data)
+        {
+          model_info = data;
+          decoding_options = model_info.decoding_options || {};
+        
+          // Set default decoding options based on the values specified in model_info.decoding_options
+          // Avoid using Jinja templates for better portability of this JS code
+          $('#header').text(model_info.name + ' (' + model_info.task.replaceAll('_', ' ') + ')')
+          $("#api").click(_ => { location.href = '/' + model_info.name + '/api' });
+          $('[name=max_output_len]').val(decoding_options.max_output_len || 512);
+          $('[name=repeat_penalty]').val(decoding_options.repeat_penalty || 1.0);
+          $('[name=sampling_temperature]').val(decoding_options.sampling_temperature || 1.0);
+          $('[name=sampling_topp]').val(decoding_options.sampling_topp || 0.92);
+          $('[name=stop_regex]').val(decoding_options.stop_regex);
+          if (decoding_options.sampling) {
+            $('#sampling').prop('checked', true);
+          }
+          if (model_info.prompt) {
+            $('#input').text(model_info.prompt);
+            updateFormatting();
+          }
+
+          set_langs($('#source_lang'), model_info.source_langs, decoding_options.source_lang);
+          set_langs($('#target_lang'), model_info.target_langs, decoding_options.target_lang);
+        }
+      });
+
+      function getData() {
+        var data = {};
+        $.each($('#playground').serializeArray(), function (_, item) {
+          data[item.name] = item.value;
+        });
+        data.input = getInput();
+        return data;
+      }
+
+      function placeCaretAtEnd(el) {
+        el.focus();
+        var range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(false);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+
+      function htmlToText(html) {
+        // html = html.replaceAll('<pre>', '```').replaceAll('</pre>', '```');
+        html = html.replace(/<pre><code class="language-([a-zA-Z]+)">([\s\S]*?)<\/code><\/pre>/g, function(match, language, text) {
+            return '```' + language + '\n' + text + '```';
+        });
+        html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, function(match, text) {
+            return '```' + '\n' + text + '```';
+        });
+
+        // TODO: add ids to such blocks to avoid confusion with generated HTML
+        html = html.replaceAll('<code>', '`').replaceAll('</code>', '`');
+        // html = html.replaceAll('<strong>', '**').replaceAll('</strong>', '**');
+        // html = html.replaceAll('<em>', '*').replaceAll('</em>', '*');
+
+        return $("<div>").html(html).text();
+      }
+
+      function getInput() {
+        return htmlToText($('#input').html());
+      }
+
+      function writeOutput(text, clear = false) {
+        var el = $('#input');
+        var text = htmlToText(el.html()) + text;
+        el.text(text);
+      }
+
+      function updateFormatting() {
+        if ($('#fancy').prop('checked')) {
+          applyFormatting('fancy');
+        } else {
+          applyFormatting('basic');
+        }
+      }
+
+      function applyFormatting(style) {
+        // automatically apply formatting on types inputs
+        var el = $('#input');
+        var content = el.html();
+        content = htmlToText(content);
+
+        if (style == 'fancy') {
+          // Escape HTML tags
+          content = $('<div>').text(content).html();
+
+          // Set 'User:' and 'Assistant:' to bold
+          content = content.replace(/(User:|Assistant:)/g, '<b>$1</b>');
+
+          content = content.replace(/```([a-zA-Z]+)?\n\s*([\s\S]*?)```/g, function(match, language, code) {
+              code = $('<div>').html(code).text();
+              if (language) {
+                var highlightedCode = Prism.highlight(code, Prism.languages[language], language);
+                return '<pre><code class="language-' + language + '">' + highlightedCode + '</code></pre>';
+              } else {
+                return '<pre><code>' + code + '</code></pre>';
+              }
+          });
+
+          // Replace inline code blocks between ` with <code> tags
+          content = content.replace(/`(\w+?)`/g, function(match, code) {
+              return '<code>' + code + '</code>';
+          });
+          el.html(content);
+        } else {
+          el.text(content);
+        }
+
+        placeCaretAtEnd(el[0]);
+      }
+
+      function generate() {
+        var data = getData();
+        data.sampling = $('#sampling').prop('checked');
+        if (ongoing) {
+          console.debug('busy...');
+          return;
+        }
+        console.debug('input:', data);
+        ongoing = true;
+        $('#chat').prop('disabled', true);
+        tokens = [];
+        scores = [];
+        elapsed = 0;
+        gen_length = 0;
+        $('#elapsed').text();
+        var params = new URLSearchParams(data);
+        var url = model_info.name + "/stream?" + params.toString();
+        source = new EventSource(url);
+
+
+        source.onmessage = function (event) {
+          var el = $('#input')[0];
+          var isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 5;
+
+          res = JSON.parse(event.data);
+
+          if ('prompt_tokens' in res) {
+            prompt_tokens = res.prompt_tokens;
+          }
+
+          if ('elapsed' in res && 'tokens' in res && tokens.length > 0) {
+            // do not count the time spent generating the first token since it can include the prompt time
+            elapsed += res.elapsed;
+            gen_length += res.tokens.length;
+            var txt = (1000 * elapsed).toFixed(0) + ' ms';
+            if (gen_length > 0) {
+              var wps = (gen_length / elapsed).toFixed(1);
+              txt += ' (' + wps + ' tokens/s)';
+            }
+            $('#elapsed').text(txt);
+          }
+
+          if ('scores' in res) {
+            scores = scores.concat(res.scores);
+          }
+
+          if ('tokens' in res) {
+            tokens = tokens.concat(res.tokens);
+            var max_token_count = model_info.max_len;
+            var token_count = prompt_tokens.length + tokens.length;
+            $('#token_count').text(token_count + '/' + max_token_count);
+          }
+
+          if ('detok' in res) {
+            writeOutput(res.detok);
+          }
+
+          if (Object.keys(res).length == 0) {  // empty result means we're finished
+            source.close();
+            ongoing = false;
+            $('#chat').prop('disabled', false);
+          }
+          
+          updateFormatting();
+          
+          if (isAtBottom) {  // continue scrolling if we're already at or close to the bottom
+            $('#input').scrollTop(el.scrollHeight);
+          }
+        };
+      }
+
+      $("#chat").click(function (e) {
+        e.preventDefault();
+        generate();
+      });
+
+      $("#stop").click(function (e) {
+        e.preventDefault();
+        if (source != null) {
+          source.close();
+          ongoing = false;
+          $('#chat').prop('disabled', false);
+        }
+      });
+
+      $("#input").keydown(function (event) {
+        if (event.key == 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          generate();
+        }
+      });
+      
+      $('#fancy').change(function(e) {
+        updateFormatting();
+      });
+
+      function setSampling() {
+        $('#sampling_topp').prop('disabled', false);
+        $('#sampling_temperature').prop('disabled', false);
+      }
+      function setGreedy() {
+        $('#sampling_topp').prop('disabled', true);
+        $('#sampling_temperature').prop('disabled', true);
+      }
+      function updateOptions() {
+        if ($('#sampling').prop('checked')) {
+          setSampling();
+        } else {
+          setGreedy();
+        }
+      }
+
+      updateOptions()
+
+      $('#sampling').change(function(e) {
+        updateOptions();
+      });
+
+      $('#toggleFields').click(function() {
+        $('#fields').toggle();  // hides/shows the fields div
+        $(this).toggleClass('toggled');
+      });
+    });
+  </script>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      line-height: 1.5;
+      background-color: #f5f5f5;
+      height: 100vh;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    #playground {
+      max-width: 800px;
+      width: 90%;
+      height: 90vh;
+      display: flex;
+      flex-direction: column;
+      background-color: #ffffff;
+      border-radius: 5px;
+      box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      padding: 20px;
+    }
+
+    .field {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      margin: 5px 0;
+      justify-content: space-between;
+    }
+
+    #input {
+      width: 100%;
+      margin-top: 10px;
+      overflow: auto;
+      border: 1px solid #ccc;
+      outline: none;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      padding: 10px;
+      box-sizing: border-box;
+    }
+
+    #input {
+      flex-grow: 1;
+    }
+
+    button {
+      background-color: #007BFF;
+      color: white;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin: auto;
+    }
+
+    button:hover {
+      background-color: #0056b3;
+    }
+
+    button:disabled {
+      background-color: #B0C7D4;
+      color: #ffffff;
+      cursor: not-allowed;
+      opacity: 0.9;
+    }
+
+    button:disabled:hover {
+      background-color: #B0C7D4;
+    }
+
+    button.toggled {
+      background-color: #B0C7D4;
+      color: #ffffff;
+      opacity: 0.9;
+    }
+
+    button.toggled:hover {
+      background-color: #B0C7D4;
+    }
+
+    code {
+      background-color: #f5f5f5; /* light gray */
+      border-radius: 5px;
+      font-family: Consolas,Monaco,'Andale Mono','Ubuntu Mono',monospace;
+      font-size: 1em;
+    }
+
+    pre {
+      background-color: #f5f5f5; /* light gray */
+      border-radius: 5px;
+      padding: 10px;
+    }
+
+    #header {
+      text-align: center;
+      font-weight: bold;
+      display: inline-block;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+
+<body>
+  <form id="playground">
+    <div class="field" id="header">
+    </div>
+    <div id="fields">
+      <div class="field">
+        <label for="source_lang">Source language:</label>
+        <select id="source_lang" name="source_lang"></select>
+      </div>
+      <div class="field">
+        <label for="target_lang">Target language:</label>
+        <select id="target_lang" name="target_lang"></select>
+      </div>
+      <div class="field">
+        <label>Max length:</label>
+        <input type="number" name="max_output_len" min="1">
+      </div>
+      <div class="field">
+        <label>Sampling:</label>
+        <input type="checkbox" id="sampling">
+      </div>  
+      <div class="field">
+        <label>Temperature:</label>
+        <input type="number" name="sampling_temperature" id="sampling_temperature" min="0" step="0.1">
+      </div>
+      <div class="field">
+        <label>Top-p:</label>
+        <input type="number" name="sampling_topp" id="sampling_topp" min="0" step="0.01">
+      </div>
+      <div class="field">
+        <label>Repeat penalty:</label>
+        <input type="number" name="repeat_penalty" min="1" step="0.01">
+      </div>
+      <div class="field">
+        <label>Stop regex:</label>
+        <input type="text" name="stop_regex">
+      </div>
+      <div class="field">
+        <label>Fancy formatting:</label>
+        <input type="checkbox" id="fancy" checked>
+      </div>
+    </div>
+    
+    <div class="field">
+      Elapsed: <span id="elapsed"></span>
+    </div>
+    <div class="field">
+      Tokens: <span id="token_count"></span>
+    </div>
+
+    <div id="input" name="input" contenteditable="true" spellcheck="false"></div>
+
+    <div class="field">
+      <button id="chat">Chat</button>
+      <button id="stop">Stop</button>
+      <button type="button" id="toggleFields">Options</button>
+      <button type="button" id="api">API</button>
+    </div>
+  </form>
+</body>
+</html>

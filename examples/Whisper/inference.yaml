@@ -1,0 +1,9 @@
+tokenizer: hf
+tokenizer_path: openai/whisper-base
+max_output_len: 440
+strip_prompt: True
+task: speech_translation
+arch: whisper_base
+beam_size: 1
+batch_size: 72000  # corresponds to ~4000 target tokens on LibriSpeech test-clean
+target_tags: ["<|en|>", "<|transcribe|>", "<|notimestamps|>"]

@@ -1,0 +1,28 @@
+data_dir: data/Doc-level
+arch: transformer_big
+batch_size: 8192
+virtual_dp_size: 32
+init_lr: 1.0e-07
+lr: 0.001
+adam_betas: [0.9, 0.98]
+max_steps: 120000
+save_interval: 1000
+valid_interval: 1000
+
+task: doc_level_translation
+lang_pairs: [en-fr]
+max_doc_size: 10
+sent_merge_prob: 0.1
+encoder_max_len: 512
+decoder_max_len: 512
+max_output_len: 500
+sent_sep: "<sep>"
+
+train_corpora:
+  - paths: ['news-commentary.{pair}', 'TED2020.{pair}', 'europarl.{pair}', 'OpenSubtitles.{pair}']
+
+valid_corpora:
+  - paths: ['newstest2014.{pair}']  # doc-level with max 2 sentences as context
+    early_stopping: True
+  - paths: ['FLORES-valid']  # sent-level
+    early_stopping: False

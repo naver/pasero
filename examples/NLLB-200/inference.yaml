@@ -1,0 +1,6 @@
+source_lang_code: True
+target_lang_code: True
+tokenizer: sentencepiece
+tokenizer_path: spm.model
+beam_size: 4
+normalize_punctuation: True

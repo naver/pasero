@@ -1,0 +1,29 @@
+data_dir: data/TED
+tokenizer_path: "top20/bpecodes"
+dict: "top20/dict.txt"
+model_dir: models/TED/top20-multiparallel
+arch: transformer
+dropout: 0.1
+label_smoothing: 0.1
+batch_size: 4096
+virtual_dp_size: 4
+init_lr: 1.0e-07
+lr: 0.0005
+clip_norm: 0.0
+bleu_tok: none
+save_interval: 15000
+valid_interval: 15000
+keep_interval: 900000
+max_steps: 900000
+lang_temperature: 5
+lang_code: True
+max_source_len: 256
+max_target_len: 256
+
+train_corpora:
+  - paths: [train]
+    source_langs: [ar, he, ru, ko, it, ja, zh_cn, es, fr, pt_br, nl, tr, ro, pl, bg, vi, de, fa, hu]
+    target_langs: [ar, he, ru, ko, it, ja, zh_cn, es, fr, pt_br, nl, tr, ro, pl, bg, vi, de, fa, hu]
+valid_corpora:
+  - paths: [valid]
+    lang_pairs: [ar-fr, fr-ar, de-fr, fr-de, ar-en, ru-en, ko-en, de-en, fr-en, en-ar, en-ru, en-ko, en-de, en-fr]

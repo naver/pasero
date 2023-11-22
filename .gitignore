@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+*.log
+env/
+/data/
+/models/
+/tmp
+.DS_Store

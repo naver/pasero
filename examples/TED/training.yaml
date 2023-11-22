@@ -1,0 +1,18 @@
+# TED Talks bilingual training configuration
+# This configuration expects -s and -t command line options to specify the source and target languages
+data_dir: data/TED                 # directory containing the training and validation data (obtained with download-TED.sh)
+tokenizer_path: "{pair}/bpecodes"  # path to the BPE model relative to 'data_dir', '{pair}' is a placeholder whose value depends on '-s' and '-t' (e.g., "-s de -t en" -> 'de-en'); a different target BPE model can be defined as "target_tokenizer"
+dict: "{pair}/dict.txt"            # path to the dictionary relative to 'data_dir', a different target dict can be defined as "target_dict"
+model_dir: models/TED/{pair}       # directory where the model checkpoints will be saved
+arch: transformer_small            # architecture of the model (e.g., transformer, adapter_transformer, etc.)
+dropout: 0.3                       # dropout rate in the Transformer; regularization is important with TED Talks, which is a small corpus, easy to overfit on
+label_smoothing: 0.1               # label smoothing amount, set to 0 for regular cross entropy
+batch_size: 4096                   # maximum number of tokens in a batch
+virtual_dp_size: 4                 # accumulate gradients over this many batches before updating the model parameters, this is normalized by the number of GPUs
+lr: 0.0005                         # maximum learning rate after warmup
+bleu_tok: none                     # disable word-tokenization in SacreBLEU (when the sources and references are pre-tokenized, like in TED Talks)
+max_steps: 25000                   # maximum number of training updates; an update corresponds to at most 'batch_size * max(num_gpus, virtual_dp_size)' target tokens (look at the 'wpb' and 'bsz' metrics for more accurate estimations of the number of target tokens and line pairs per update)
+save_interval: 1000                # save a checkpoint every N updates
+valid_interval: 1000               # evaluate the model every N updates
+patience: 5                        # stop training if the validation score has not improved in the last N evaluations
+early_stopping_metric: chrf        # validation metric used for best checkpoint selection and patience-based early stopping

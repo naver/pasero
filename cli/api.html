@@ -1,0 +1,130 @@
+<!-- 
+Pasero Copyright (c) 2023-present NAVER Corporation
+Please refer to the license file provided in the project.
+-->
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Pasero Playground</title>
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/themes/prism.min.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-yaml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-json.min.js"></script>
+</head>
+<body>
+    <pre><code class="language-python">
+###################
+# API documentation
+###################
+
+import requests, json
+
+url = '{{ request.host_url }}'
+
+# Get the list of available commands and decoding options
+help = requests.get(f'{url}/help').json()
+
+# Get the list of available models
+models = requests.get(f'{url}/list').json()
+
+# Name of a model in the list. Models are queried by their name
+model = '{{ model_info.name }}'
+
+decoding_opts = {
+{% for key, value in model_info.decoding_options.items() %}    {{ key }}: {{ value }},
+{% endfor %}}
+
+##################
+# Batched decoding
+##################
+{% if model_info.task == 'dialogue' %}
+inputs = [
+    (
+        'User: Hello! What is 1 + 1?\n'
+        'Assistant:'
+    ),
+    (
+        'Your are a storywriting bot that likes pirates.\n'
+        'User: Please tell me a story.\n'
+        'Assistant:'
+    ),
+]
+
+out = requests.get(
+    f'{url}/{model}/decode',
+    params={'input': inputs, **decoding_opts},
+).json()
+
+#################
+# Token streaming
+#################
+
+# Streaming does not work with multiple inputs
+input = (
+    'Your are a storywriting bot that likes pirates.\n'
+    'User: Please tell me a story.'
+)
+
+response = requests.get(
+    f'{url}/{model}/stream',
+    params={'input': input, **decoding_opts},
+    stream=True,
+)
+
+for line in response.iter_lines(decode_unicode=True):
+    if line:
+        data = json.loads(line.split("data: ")[1])
+        if data:
+            word = data.get('detok')
+            if word:  # print words as they are generated
+                print(word, end='', flush=True)
+{% elif model_info.task == 'language_modeling' %}
+inputs = [
+    '1 + 1 = ',
+    'Once upon a time,',
+    'Once upon a time,',  # generate two different completions for this prompt
+]  # inputs will be batched according to the model's configuration
+
+out = requests.get(
+    f'{url}/{model}/decode',
+    params={'input': inputs, **decoding_opts},
+).json()
+
+#################
+# Token streaming
+#################
+
+# Streaming does not work with multiple inputs
+input = 'Once upon a time,'
+
+response = requests.get(
+    f'{url}/{model}/stream',
+    params={'input': input, **decoding_opts},
+    stream=True,
+)
+
+for line in response.iter_lines(decode_unicode=True):
+    if line:
+        data = json.loads(line.split("data: ")[1])
+        if data:
+            word = data.get('detok')
+            if word:  # print words as they are generated
+                print(word, end='', flush=True)
+{% else %}
+inputs = [
+    "Les chaussettes de l'Archiduchesse sont-elles sèches ?",
+    "Un chasseur sachant chasser doit savoir chasser sans son chien.",
+]
+
+out = requests.get(
+    f'{url}/{model}/decode',
+    params={'input': inputs, **decoding_opts},
+).json()
+{% endif %}
+</code></pre>
+</body>
+</html>

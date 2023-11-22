@@ -1,0 +1,31 @@
+# TED Talks English-centric 20-language configuration, similar to our "Efficient Inference" and "Monolingual Adapters" papers
+data_dir: data/TED                # path to the data obtained with download-TED.sh
+tokenizer_path: "top20/bpecodes"  # shared multilingual BPE model
+dict: "top20/dict.txt"            # shared multilingual dictionary
+model_dir: models/TED/top20
+arch: transformer                 # Transformer Base model (44M parameters excluding embeddings)
+dropout: 0.3
+label_smoothing: 0.1
+batch_size: 4096
+virtual_dp_size: 4
+init_lr: 1.0e-07
+lr: 0.0005
+clip_norm: 0.0
+bleu_tok: none
+save_interval: 15000
+valid_interval: 15000
+keep_interval: 900000          # keep one checkpoint in the middle of training
+max_steps: 1800000             # around 120 epochs (~5 days on 4 V100s)
+lang_temperature: 5            # compute sampling probabilities of all language pairs using this temperature (> 1: closer to uniform sampling)
+lang_code: True                # prefix each source sentence with a tag indicating the language of the target sentence
+
+
+train_corpora:        # English-centric training on 38 directions
+  - paths: [train]    # looks for train.{src} and train.{tgt} files for all {src}-{tgt} language pair, this path can also contain '{pair}', '{src}' and '{tgt}' placeholders
+    source_langs: [ar, he, ru, ko, it, ja, zh_cn, es, fr, pt_br, nl, tr, ro, pl, bg, vi, de, fa, hu]
+    target_langs: [en]   # lang pairs are the product of source_langs and target_langs, excluding pairs where src=tgt
+    bidir: True       # language pairs in both directions will be included
+valid_corpora:        # to speed-up validation, only evaluate on a few "representative" language pairs; the average score over all validation corpora will be used for best checkpoint selection (except those with "early_stopping: False")
+  - paths: [valid]
+    lang_pairs: [ar-en, ru-en, ko-en, fr-en, de-en]  # instead of a product of source_langs and target_langs, lang pairs can also be defined manually like this
+    bidir: True

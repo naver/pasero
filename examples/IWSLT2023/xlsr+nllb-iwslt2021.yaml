@@ -1,0 +1,79 @@
+# PATHS
+data_dir: data/iwslt2023/xlsr128-18
+tokenizer: sentencepiece
+tokenizer_path: ../spm.model  # in data/iwslt2023
+dict: ../dict.txt
+ckpt: data/iwslt2023/nllb_1.3B_distilled.bin
+
+# ARCHITECTURE
+arch: adapter_nllb_1b3
+encoder_positional_encoding: sinusoidal
+encoder_embed_norm: False
+encoder_layers: 24
+shift_encoder_layers: 0
+flexible: True
+conv_input_dim: 80
+conv_kernel_sizes: [5]
+input_dim: 1024
+seed: 3
+train_params_regex: '(?!.*\.in_linear|.*\.subsample|encoder\.layers\.[0-2]\.|.*\.adapters|encoder\.layernorm_embedding)'
+encoder_adapter_layer_ids: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+# REGULARIZATION
+dropout: 0.3
+attention_dropout: 0.1
+label_smoothing: 0.2
+
+# OPTIMIZATION
+lr: 0.0005
+warmup: 10000
+init_lr: 1.0e-07
+clip_norm: 0.0
+batch_size: 4000
+virtual_dp_size: 8
+max_steps: 300000
+encoder_max_len: 2048
+decoder_max_len: 128
+
+# min_len_ratio: 3
+# max_len_ratio: 40
+
+# VALIDATION AND SAVING
+save_interval: 5000
+valid_interval: 5000
+# keep_last: 3
+# average_checkpoints: True
+early_stopping_metric: bleu
+patience: 5
+patience_min_steps: 75000  # training cannot be stopped before 75k + 4*5k = 95k steps
+
+# DATASETS
+task: speech_translation
+target_lang_code: True
+lang_temperature: 3
+buffer_size: 8000
+dataset_type: dynamic
+dataloader_workers: 1
+normalize_punctuation: True  # for NLLB
+
+train_corpora:
+  - source_paths: ["mtedx/{pair}/train.npy"]  # ASR
+    target_paths: ["mtedx/{pair}/train"]
+    lang_pairs: [es-es, fr-fr, pt-pt, it-it]
+    allow_monolingual: True
+  - source_paths: [ted-lium/train.npy]  # EN ASR
+    target_paths: [ted-lium/train]
+    lang_pairs: [en-en]
+    allow_monolingual: True
+  - source_paths: ["mtedx/{pair}/train.npy"]  # MTEDX ST
+    target_paths: ["mtedx/{pair}/train"]
+    lang_pairs: [es-en, fr-en, pt-en, fr-es, es-fr, es-pt, fr-pt, es-it]
+
+valid_corpora:
+  - source_paths: ["mtedx/{pair}/valid.npy"]
+    target_paths: ["mtedx/{pair}/valid"]
+    lang_pairs: [fr-en, es-en, fr-es, pt-en]
+  - source_paths: ["mtedx/{pair}/valid.npy"]
+    target_paths: ["mtedx/{pair}/valid"]
+    lang_pairs: [pt-pt, it-it]
+    early_stopping: False

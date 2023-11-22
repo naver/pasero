@@ -1,0 +1,30 @@
+# ParaCrawl 26-language multi-parallel fine-tuning configuration (for 200k steps)
+# The --ckpt option should be used to specify the model that is being fine-tuned (e.g., an English-centric model obtained with 'training-en-centric.yaml')
+# If --continue is also given, the optimizer state and scheduler will be restored (and the model will probably converge faster)
+data_dir: data/ParaCrawl-Euro         # path to the data obtained with download-paracrawl.sh
+tokenizer_path: "bpecodes"            # shared multilingual BPE model
+dict: "dict.txt"                      # shared multilingual dictionary
+arch: transformer_wide                # same as Transformer Big, but with twice larger FFN blocks (302M paramerers excluding embeddings)
+encoder_layers: 12                    # deep encoder /
+decoder_layers: 2                     # shallow decoder (faster at inference than 6-6 models)
+dropout: 0.1
+label_smoothing: 0.1
+batch_size: 8192                      # large batch size, can cause memory issues (if OOMs, set to batch_size: 4096, virtual_dp_size: 64)
+virtual_dp_size: 32
+init_lr: 1.0e-07
+lr: 0.001                             # this will be ignored if --continue is set (the fine-tuned model's scheduler state is restored)
+adam_betas: [0.9, 0.98]
+valid_interval: 5000
+keep_interval: 20000
+max_steps: 200000                     # ~1 week on 4 V100s
+lang_temperature: 2                   # smaller temperature in multi-parallel settings to avoid degrading English-centric performance too much
+lang_code: True                       # prepend a target language code to the source sentences
+
+train_corpora:   # multi-parallel training on 650 directions
+  - paths: ['bilingual/ParaCrawl.{pair}']
+    source_langs: [en, fr, de, es, it, pt, nl, nb, cs, pl, sv, da, el, fi, hr, hu, bg, ro, sk, lt, lv, sl, et, ga, is, mt]
+    target_langs: [en, fr, de, es, it, pt, nl, nb, cs, pl, sv, da, el, fi, hr, hu, bg, ro, sk, lt, lv, sl, et, ga, is, mt]
+valid_corpora:   # to speed-up validation: 100 samples per language pair concatenated into per-target language valid sets
+  - paths: ['data/FLORES/euro/FLORES-valid']
+    source_langs: [src]
+    target_langs: [en, fr, de, es, it, pt, nl, nb, cs, pl, sv, da, el, fi, hr, hu, bg, ro, sk, lt, lv, sl, et, ga, is, mt]

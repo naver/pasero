@@ -1,0 +1,7 @@
+tokenizer: sentencepiece
+tokenizer_path: spiece.model
+arch: t5_large
+sampling: True
+sampling_temperature: 1.0
+sampling_topp: 0.92
+keep_whitespaces: True

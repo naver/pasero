@@ -1,0 +1,56 @@
+<!-- 
+Pasero Copyright (c) 2023-present NAVER Corporation
+Please refer to the license file provided in the project.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pasero models</title>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+      body {
+          font-family: Arial, sans-serif;
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 100vh;
+          background-color: #f4f4f4;
+      }
+      .model-box {
+          padding: 20px;
+          border: 1px solid #ccc;
+          margin: 10px;
+          background-color: #007BFF; /* Blue background color */
+          color: #fff; /* White text color */
+          box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+          transition: box-shadow 0.1s ease, background-color 0.1s ease;
+          text-align: center;
+          text-decoration: none; /* Remove underline from the link */
+      }
+      .model-box:hover {
+          box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);
+          background-color: #0056b3; /* Darken the blue a bit on hover */
+      }
+      .models-container {
+          display: flex;
+          flex-wrap: wrap;
+      }
+    </style>
+</head>
+<body>
+    <div class="models-container">
+        {% for model in models %}
+            <a href="/{{ model.name }}" class="model-box">
+                <h3>{{ model.name }}</h3>
+                <p>Type: {{ model.model_type|replace('_', '-') }}</p>
+                {% if model.param_count %}
+                <p>Size: {{ (model.param_count / 10**9) | round(2) }}B </p>
+                {% endif %}
+                <p>Task: {{ model.task|replace('_', ' ') }}</p>
+            </a>
+        {% endfor %}
+    </div>
+</body>
+</html>
