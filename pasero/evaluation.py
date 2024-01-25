@@ -12,15 +12,40 @@ import multiprocessing
 import functools
 import itertools
 import random
+import jiwer
 from typing import Iterable, Iterator, Sequence, Optional
 
-METRICS = ['chrf', 'bleu', 'langid', 'len_ratio', 'chrf++', 'spbleu', 'wer']
+METRICS = ['chrf', 'bleu', 'langid', 'len_ratio', 'chrf++', 'spbleu', 'wer', 'cer']
 BLEU_TOKENIZERS = sacrebleu.metrics.METRICS['BLEU'].TOKENIZERS
-
+JIWER_TRANSFORMATIONS = jiwer.Compose([
+    jiwer.ToLowerCase(),
+    jiwer.RemoveMultipleSpaces(),
+    jiwer.Strip(),
+    jiwer.RemovePunctuation(),
+    jiwer.ReduceToListOfListOfWords(word_delimiter=" "),
+])
+JICER_TRANSFORMATIONS = jiwer.Compose([
+    jiwer.ToLowerCase(),
+    jiwer.RemoveMultipleSpaces(),
+    jiwer.Strip(),
+    jiwer.RemovePunctuation(),
+    jiwer.ReduceToListOfListOfChars(),
+])
 
 def lower_is_better(metric: str) -> bool:
-    return 'loss' in metric or 'ppl' in metric
+    return 'loss' in metric or 'ppl' in metric or 'wer' in metric or 'cer' in metric
 
+def jiwer_scores(
+    hyps: list[str],
+    refs: list[str],
+    metric: str = 'wer',
+):
+    if metric == 'wer':
+        return 100*jiwer.wer(refs, hyps, truth_transform=JIWER_TRANSFORMATIONS, hypothesis_transform=JIWER_TRANSFORMATIONS)
+    elif metric == 'cer':
+        return 100*jiwer.cer(refs, hyps, truth_transform=JICER_TRANSFORMATIONS, hypothesis_transform=JICER_TRANSFORMATIONS)
+    else:
+        raise NotImplementedError(f"metric {metric} not implemented in jiwer_scores")
 
 def langid_py(line: str) -> str:
     import langid
@@ -275,10 +300,8 @@ def score(
         chrf_word_order = 2 if metric == 'chrf++' else 0
         bleu_tok = 'flores200' if metric == 'spbleu' else bleu_tok
 
-        if metric == 'wer':
-            from jiwer import wer
-            hyps, refs = zip(*[(hyp, ref) for hyp, ref in zip(hyps, refs) if hyp and ref])
-            score = 100 * wer(list(refs), list(hyps))
+        if metric in ('wer', 'cer'):
+            score = jiwer_scores(hyps, refs, metric)
         elif metric in ('bleu', 'spbleu'):
             metric_ = sacrebleu.metrics.BLEU(tokenize=bleu_tok, force=True)
             out = metric_.corpus_score(hyps, [refs])

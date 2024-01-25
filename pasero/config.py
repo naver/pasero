@@ -491,6 +491,7 @@ class EvalConfig(Config):
         defaults={
             'language_modeling': [],
             'translation': ['chrf', 'bleu', 'chrf++', 'spbleu', 'len_ratio'],
+            'speech_translation': ['chrf', 'bleu', 'chrf++', 'spbleu', 'len_ratio', 'wer', 'cer'],
         },
         help='evaluation metrics to compute'
     )

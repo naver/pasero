@@ -596,6 +596,7 @@ class MultiheadAttention(nn.Module):
 
         batch_size, tgt_len, embed_dim = query.size()
         src_len = key.size(1)
+        return_attn = True
 
         q = self.q_proj(query)  # BxTxD
         q = q.view(batch_size, tgt_len, self.num_heads, self.head_dim)  # BxTxHxD'
