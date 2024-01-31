@@ -570,6 +570,8 @@ def log(
         ('ppl {:.2f}', ppl),
         ('lines {:.4g}', metrics.sum('num_lines')),
         ('tokens {:.4g}', metrics.sum('num_tokens')),
+        ('wer {:.2f}', metrics.val('wer')),
+        ('cer {:.2f}', metrics.val('cer')),
         ('bleu {:.2f}', metrics.val('bleu')),
         ('spbleu {:.2f}', metrics.val('spbleu')),
         ('len_ratio {:.3f}', metrics.val('len_ratio')),
