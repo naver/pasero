@@ -20,20 +20,21 @@ from torch import Tensor
 from typing import Union, Optional
 from pasero import utils
 from pasero.tasks import Task
-from pasero.config import AdapterTransformerConfig, DistributedConfig
+from pasero.config import register_model, AdapterTransformerConfig, DistributedConfig
 from . import modules
 from .modules import Embedding, AdapterLayer
 from .transformer import Transformer, DummyEncoder
 from .transformer import TransformerEncoder, TransformerDecoder, TransformerEncoderLayer, TransformerDecoderLayer
 
 
-logger = logging.getLogger('models')
+logger = logging.getLogger('adapters')
 
 
 _LANG_PREFIX = 'lang:'
 _DOMAIN_PREFIX = 'domain:'
 
 
+@register_model('adapter_transformer')
 class AdapterTransformer(Transformer):
     """
     Transformer with bottleneck adapters after each of its layers, with the same architecture as 

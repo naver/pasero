@@ -11,11 +11,11 @@ import torch.nn.functional as F
 from typing import Optional, Union
 from torch import Tensor, LongTensor, BoolTensor
 from . import modules
-from .modules import Embedding, Identity
+from .modules import Embedding, Identity, AdapterLayer
 from pasero import utils
 from pasero.tasks import Task
-from pasero.utils import defined, SpecialTokens
-from pasero.config import DistributedConfig, TransformerConfig
+from pasero.utils import defined
+from pasero.config import register_model, DistributedConfig, TransformerConfig
 
 
 logger = logging.getLogger('models')
@@ -25,16 +25,19 @@ class BaseModel(nn.Module):
     """
     Base class for encoders, decoders and encoder-decoder models
     """
-    special_tokens: SpecialTokens
+    cfg: TransformerConfig
 
     @property
-    def padding_idx(self) -> int: return self.special_tokens.padding_idx
+    def padding_idx(self) -> int: return self.cfg.padding_idx
     @property
-    def bos_idx(self) -> int: return self.special_tokens.bos_idx
+    def bos_idx(self) -> int: return self.cfg.bos_idx
     @property
-    def eos_idx(self) -> int: return self.special_tokens.eos_idx
+    def eos_idx(self) -> int: return self.cfg.eos_idx
     @property
-    def unk_idx(self) -> int: return self.special_tokens.unk_idx
+    def unk_idx(self) -> int: return self.cfg.unk_idx
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError
 
     def parallelize(self, devices: list[str]) -> None: pass
 
@@ -45,18 +48,10 @@ class Encoder(BaseModel):
     """
     task: Task
     embed_tokens: Optional[Embedding]
-    cfg: TransformerConfig
-    
-    @property
-    def special_tokens(self) -> SpecialTokens:
-        return self.task.special_tokens
 
     @property
     def max_len(self) -> int:
         return self.cfg.encoder_max_len
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError
 
 
 class Decoder(BaseModel):
@@ -65,18 +60,10 @@ class Decoder(BaseModel):
     """
     task: Task
     embed_tokens: Optional[Embedding]
-    cfg: TransformerConfig
     
-    @property
-    def special_tokens(self) -> SpecialTokens:
-        return self.task.special_tokens
-
     @property
     def max_len(self) -> int:
         return self.cfg.decoder_max_len
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError
 
     @staticmethod
     def reorder_state(state: Optional[dict[str, Tensor]], indices: LongTensor) -> None:
@@ -110,17 +97,13 @@ class EncoderDecoder(BaseModel):
     Base class for Transformer and EnsembleModel
     """
     task: Task
-    cfg: TransformerConfig
     
-    @property
-    def special_tokens(self) -> SpecialTokens:
-        return self.task.special_tokens
-
     @property
     def total_param_count(self) -> int:
         return sum(param.numel() for param in self.parameters())
 
 
+@register_model('transformer')
 class Transformer(EncoderDecoder):
     """
     Base class for all other models: encoder-decoder Transformer Base model.
@@ -154,8 +137,7 @@ class Transformer(EncoderDecoder):
                 `TransformerConfig.setup_for_inference` to take these new options into account.
             dist_cfg: contains the tensor parallelism settings
             task: which task this model will be used for (e.g., an instance of TranslationTask or LanguageModelingTask),
-                contains the tokenizers (used for initializing the embeddings), special token ids, set of languages,
-                etc.
+                contains the tokenizers (used for initializing the embeddings), set of languages, etc.
         """
         super().__init__()
         self.cfg = cfg
@@ -225,64 +207,76 @@ class Transformer(EncoderDecoder):
             embed=embed,
         )
 
+    def disable_adapters(self) -> None:
+        """
+        Temporarily disable adapters (bottleneck adapters of AdapterTransformer or LoRAs)
+        They can be enabled again by calling `self.enable_adapters()`
+        """
+        for module in self.modules():
+            if isinstance(module, AdapterLayer):
+                module.disable()
+
+    def enable_adapters(self) -> None:
+        """
+        Re-enable adapters that were disabled with `self.disable_adapters()`
+        """
+        for module in self.modules():
+            if isinstance(module, AdapterLayer):
+                module.enable()
+    
     def forward(
         self,
-        source: Optional[Tensor] = None,
-        source_length: Optional[LongTensor] = None,
+        encoder_input: Optional[Tensor] = None,
+        encoder_input_length: Optional[LongTensor] = None,
         decoder_input: Optional[LongTensor] = None,
-        target: Optional[LongTensor] = None,
         prompt_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> tuple[Tensor, dict]:
         """
-        Run a full forward step of the Transformer: taking a batch of source and target sequences,
-        1) encode the sources with the encoder and generate sequences of encoder states
-        2) input the decoder with these encoder states and decoder inputs (i.e., targets shifted by one position to the 
-        right)
+        Run a full forward step of the Transformer: taking a batch of encoder and decoder input sequences,
+        1) encode the encoder inputs and generate sequences of encoder states
+        2) input the decoder with these encoder states and decoder inputs
+        3) build target sequences by shifting decoder inputs
         3) generate a distribution over the target vocabulary and compute cross entropy against the target sequences
-
+        
         Args:
-            source: padded sequences of indices or source features
-            source_length: real lengths of the sequences in `source`
-            decoder_input: target indices shifted by one position to the right (the first token is BOS)
-            target: padded sequences of indices ending with EOS
-            prompt_mask: mask with 1s at the position of prefix tokens (e.g., language codes or source tokens in the 
-                case of decoder-only machine translation)
+            encoder_input: padded sequences of indices or source features
+            encoder_input_length: real lengths of the sequences in `encoder_input`
+            decoder_input: padded sequences of indices to use as input for the decoder and as target for the training
+                loss. Should contain an EOS token (obtained by passing `append_eos=True` to `Task.preprocess`) and 
+                optionally a BOS token.
+            prompt_mask: mask of the same shape as `decoder_input`, with 1s at the position of prefix tokens
+                (e.g., language codes or source tokens in the case of decoder-only machine translation)
         Shape:
-            source: (B, S) or (B, S, D) with binary inputs (e.g., with '--task speech_translation')
-            source_length: (B,)
+            encoder_input: (B, S) or (B, S, D) with binary inputs (e.g., with '--task speech_translation')
+            encoder_input_length: (B,)
             decoder_input: (B, T)
-            target: (B, T)
             prompt_mask: (B, T)
 
-        Note that `decoder_input` has the same length `target`. The dimension named "T" in the shape notations
-        above includes the EOS token in `target` and the BOS token of `decoder_input`.
-        
-        Example with T=3 and B=1 (here bos_idx = eos_idx = 2):
-        ```
-        decoder_input = [[2, 43, 134]]
-        target = [[43, 134, 2]]
-        ```
+        Note that the last token of `decoder_input` will not be passed to the decoder (it should be EOS), but will be 
+        used for shifting these sequences and creating the target sequences for the training loss.
+        For example, if `decoder_input` is `[[2, 43, 134, 2, 1, 1]]` (`bos_idx=eos_idx=2` and `padding_idx=1`),
+        the input to the decoder is `[[2, 43, 134, 2, 1]]` and the loss target is `[[43, 134, 2, 1, 1]]`.
 
         Returns: a tuple (loss, logs), the output of `compute_loss`
         """
-        encoder_out, encoder_mask, enc_layer_outputs = self.encoder(source, source_length, **kwargs)
+        # At training, decoder_input should contain both BOS and EOS
+        target = decoder_input[:,1:]
+        decoder_input = decoder_input[:,:-1]
+
+        encoder_out, encoder_mask, enc_layer_outputs = self.encoder(encoder_input, encoder_input_length, **kwargs)
         # encoder_out: Tensor of shape (B, S, D) containing the output of the last encoder layer
         # encoder_mask: BoolTensor of shape (B, S) with True at every padding token position
         decoder_out, dec_layer_outputs = self.decoder(
             encoder_out,
             encoder_mask,
             decoder_input,
-            prompt_mask=prompt_mask,
+            prompt_mask=prompt_mask[:, :-1],
             **kwargs,
         )
         # decoder_out: Tensor of shape (B, T, V) containing the output of the output projection (i.e., logits)
         layer_outputs = {**enc_layer_outputs, **dec_layer_outputs}
 
-        if self.cfg.prompt_loss == 0:  # disable loss computation over the prefix tokens
-            # mask the prefix, including the separator (we don't want to compute the loss over those tokens)
-            target = target.masked_fill(prompt_mask, self.padding_idx)
-        
         prompt_loss_scale = self.cfg.prompt_loss
 
         if prompt_loss_scale == 1.0:  # same loss multiplier is applied on all parts of the sequence
@@ -303,9 +297,12 @@ class Transformer(EncoderDecoder):
             - nll_loss: gen nll loss (to normalize by `num_tokens - num_prompt_tokens`)
             - prompt_nll_loss: Prompt nll loss (to normalize by `num_prompt_tokens`)
             """
+            prompt_mask = prompt_mask[:, 1:]  # like `decoder_input`, this contains both BOS and EOS. The target 
+            # sequence is shifted, so should this mask
+
             loss, logs = self.compute_loss(  # Gen loss
                 decoder_out,
-                target.masked_fill(prompt_mask, self.padding_idx),
+                target.masked_fill(prompt_mask, self.padding_idx),  # disable loss computation over the prefix tokens
                 layer_outputs,
             )
             
@@ -356,7 +353,7 @@ class Transformer(EncoderDecoder):
         """
         batch_size = target.size(0)
         logits = logits.float().view(-1, logits.size(-1))
-        target = target.view(-1)
+        target = target.reshape(-1)  # not view(-1) because target is a slice of `decoder_input`
         # activations take (2 * NUM_TGT_TOKENS * VOCAB_SIZE * 4) bytes 
         loss_fn = functools.partial(
             F.cross_entropy,
@@ -700,21 +697,21 @@ class TransformerEncoder(Encoder):
     @utils.benchmark('encoder')
     def forward(
         self,
-        source: Tensor,
-        source_length: LongTensor,
+        encoder_input: Tensor,
+        encoder_input_length: LongTensor,
         return_layers: list[str] = [],
         meta: dict = {},  # unused here, but may be used in subclasses
         **kwargs,  # unused
     ) -> tuple[Tensor, BoolTensor, dict]:
         """
         Args:
-            source: batch of token or feature sequences
-            source_length: length of each sequence in the batch
+            encoder_input: batch of tokens or feature sequences
+            encoder_input_length: length of each sequence in the batch
             return_layers: tuple of strings specifying which layer outputs to return (e.g., 'enc_0_self_attn')
             meta: metadata about this batch (source and target languages, domain, etc.)
         Shape:
-            source: (B, S) or (B, S, D)
-            source_length: (B,)
+            encoder_input: (B, S) or (B, S, D)
+            encoder_input_length: (B,)
         
         Returns: a tuple (encoder_out, padding_mask, layer_outputs) with
             encoder_out: a Tensor containing the output of the last encoder layer
@@ -724,22 +721,23 @@ class TransformerEncoder(Encoder):
         """
         return_layers = return_layers or ()
 
-        x = (
-            self.embed_tokens(source) if source.ndim == 2
-            else source   # input is already binary (e.g., speech features)
-        )
-        # `embed_tokens` might not be on self.device is embeddings are shared between encoder and decoder
-        # in this case, `source` is automatically put on the right device by `embed_tokens`
-        
-        x = x.to(self.device)
-        source_length = source_length.to(self.device)
-        if self.in_linear is not None:
-            x = self.in_linear(x)
-        if self.subsample is not None:
-            x, source_length = self.subsample(x, source_length)
+        encoder_input_length = encoder_input_length.to(self.device)
+
+        if encoder_input.ndim == 2:  # token ids
+            x = self.embed_tokens(encoder_input)
+            # `embed_tokens` might not be on self.device is embeddings are shared between encoder and decoder
+            # in this case, `encoder_input` is automatically put on the right device by `embed_tokens`
+            x = x.to(self.device)
+        else:  # speech features
+            x = encoder_input
+            x = x.to(self.device)
+            if self.in_linear is not None:
+                x = self.in_linear(x)
+            if self.subsample is not None:
+                x, encoder_input_length = self.subsample(x, encoder_input_length)
 
         x *= self.embed_scale
-        padding_mask = utils.len_to_mask(source_length, size=x.size(1))  # BxS
+        padding_mask = utils.len_to_mask(encoder_input_length, size=x.size(1))  # BxS
         x += self.embed_positions(x.size(1))
 
         x = self.layernorm_embedding(x)
@@ -867,13 +865,6 @@ class TransformerDecoder(Decoder):
         decoder_input = decoder_input.to(self.device)
         padding_mask = decoder_input.eq(self.padding_idx)
         
-        if self.cfg.disable_bos:
-            # This is useful for the BLOOM models, which do not use any beginning of sequence (we replace it with 
-            # padding). TODO: tried at decoding but not at training. It would probably be good to pad the target as
-            # well (we don't want to predict the first token from padding, but rather predict the second token from the
-            # first)
-            decoder_input[decoder_input == self.bos_idx] = self.padding_idx
-
         length = decoder_input.size(1)
         pos_offset = state.get('offset', 0) if state else 0
         pos_embed = self.embed_positions(length, offset=pos_offset)
@@ -888,7 +879,12 @@ class TransformerDecoder(Decoder):
 
         layer_outputs = {}
         for layer in self.layers:
-            x, layer_output = layer(x, encoder_out, encoder_mask, padding_mask, prompt_mask, state, return_layers)
+            x, layer_output = layer(
+                x, encoder_out, encoder_mask, padding_mask,
+                prompt_mask=prompt_mask,
+                state=state,
+                return_layers=return_layers,
+            )
             layer_outputs.update(layer_output)
 
         x = x.to(self.device)
@@ -1037,7 +1033,7 @@ class TransformerEncoderLayer(nn.Module):
         x = self.enter(x)
         padding_mask = self.enter(padding_mask)
         return_attn = self.self_attn_key in self.return_layers
-        x, self_attn = self.self_attn(query=x, key=x, value=x, key_padding_mask=padding_mask, return_attn=return_attn)
+        x, self_attn = self.self_attn(query=x, key=x, value=x, attn_mask=padding_mask, return_attn=return_attn)
         x = self.exit(x)
         if return_attn:
             self_attn = self.exit(self_attn)
@@ -1061,8 +1057,8 @@ class TransformerEncoderLayer(nn.Module):
         self,
         x: Tensor,
         padding_mask: BoolTensor,
-        return_layers: list[str] = [],
         /,  # all above arguments are positional-only
+        return_layers: list[str] = [],
     ) -> tuple[Tensor, dict]:
         """
         Shape:
@@ -1180,7 +1176,6 @@ class TransformerDecoderLayer(nn.Module):
             lora_rank=cfg.lora_rank,
             lora_alpha=cfg.lora_alpha,
         )
-        
         self.fc3 = modules.Linear(  # Llama or T5
             cfg.embed_dim,
             ffn_dim,
@@ -1253,6 +1248,7 @@ class TransformerDecoderLayer(nn.Module):
         x: Tensor,
         residual: Tensor,  # unused here, but may be used in subclasses
         padding_mask: BoolTensor,
+        self_attn_mask: Optional[BoolTensor] = None,
         state: Optional[dict[str, Tensor]] = None,
     ) -> Tensor:
         """
@@ -1260,6 +1256,7 @@ class TransformerDecoderLayer(nn.Module):
             x: (B, T, D)
             residual: (B, T, D)
             padding_mask: (B, S)
+            self_attn_mask: (B, T, T)
         """
         x = self.enter(x)
         
@@ -1279,6 +1276,7 @@ class TransformerDecoderLayer(nn.Module):
             query=x, key=x, value=x,
             state=self_attn_state,
             return_attn=return_attn,
+            attn_mask=self_attn_mask,
         )
         
         x = self.exit(x)
@@ -1312,7 +1310,7 @@ class TransformerDecoderLayer(nn.Module):
         return_attn = self.cross_attn_key in self.return_layers
         x, cross_attn = self.encoder_attn(
             query=x, key=encoder_out, value=encoder_out,
-            key_padding_mask=encoder_mask,
+            attn_mask=encoder_mask,
             return_attn=return_attn,
         )
         x = self.exit(x)
@@ -1346,10 +1344,11 @@ class TransformerDecoderLayer(nn.Module):
         encoder_out: Optional[Tensor],
         encoder_mask: Optional[BoolTensor],
         padding_mask: BoolTensor,
+        /,  # all above arguments are positional-only
+        self_attn_mask: Optional[BoolTensor] = None,
         prompt_mask: Optional[BoolTensor] = None,
         state: Optional[dict[str, Tensor]] = None,
         return_layers: list[str] = [],
-        /,  # all above arguments are positional-only
     ) -> tuple[Tensor, dict]:
         """
         Shape:
@@ -1357,6 +1356,7 @@ class TransformerDecoderLayer(nn.Module):
             encoder_out: (B, S, D)
             encoder_mask: (B, S)
             padding_mask: (B, T)
+            self_attn_mask: (B, T, T)
         """
         self.return_layers = return_layers
 
@@ -1372,7 +1372,7 @@ class TransformerDecoderLayer(nn.Module):
 
         residual = x
         x = self.self_attn_prenorm(x)
-        x = self.self_attention(x, residual, padding_mask, state=state)
+        x = self.self_attention(x, residual, padding_mask, self_attn_mask=self_attn_mask, state=state)
 
         if self.cfg.parallel_attention:
             # FFN and ATTN blocks take the same inputs and can be computed in parallel. The residual connexion

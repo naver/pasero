@@ -25,11 +25,11 @@ except:
 
 logger = logging.getLogger('train')
 
-from pasero import utils, models, tasks, evaluation, datasets
-from pasero.models import modules
+from pasero import utils, evaluation
+from pasero.models import modules, Transformer
 from pasero.training import Trainer, MultiprocessingStatus
 from pasero.datasets import ValidationDataset, TrainingDataset
-from pasero.config import TrainingConfig
+from pasero.config import get_task_class, get_dataset_class, get_architecture, TrainingConfig, DecodingConfig
 from pasero.tasks import Task
 
 
@@ -67,11 +67,17 @@ def run_dist_training(
     try:
         if torch.cuda.is_available():
             torch.cuda.set_device(cfg.device)
-        
+        else:
+            assert cfg.dtype not in ('float16', 'bfloat16'), 'half-precision training is not supported on CPU, ' \
+                'use --dtype float32'
+
         if cfg.dtype == 'bfloat16':
+            assert torch.cuda.get_device_capability()[0] >= 8, (
+                 'the bfloat16 data type is not supported by your device: use --dtype float16'
+            )
             # save time and CPU memory by automatically creating tensors of the right type
             torch.set_default_dtype(torch.bfloat16)
-        
+
         if utils.is_distributed(cfg):
             dist.init_process_group(
                 'nccl',
@@ -143,9 +149,9 @@ def run_training(
     train_metrics.start('total_wall')
 
     # find the model, task and dataset classes specified by the training config (--arch, --task, --dataset-type)
-    arch_cls = models.get_architecture(cfg.model_cfg)
-    task_cls = tasks.get_task_class(cfg.task)
-    dataset_cls = datasets.get_dataset_class(cfg.dataset_cfg)
+    arch_cls = get_architecture(cfg.model_cfg)
+    task_cls = get_task_class(cfg.task)
+    dataset_cls = get_dataset_class(cfg.dataset_cfg)
     
     # corpus definitions (do not contain actual data)
     train_corpora = task_cls.get_train_corpora(cfg.task_cfg, cfg.data_dir, cfg.train_corpora)
@@ -163,9 +169,8 @@ def run_training(
     else:
         assert valid_corpora
     
-    # TODO: if model_cfg.disable_bos, set task.special_tokens.bos_idx to None
-    task = task_cls(cfg.data_dir, cfg.task_cfg)
-    task.set_model_type(cfg.model_cfg.model_type)
+    task: Task = task_cls(cfg.data_dir, cfg.task_cfg)
+    task.setup_for_model(cfg.model_cfg)
     task.register_corpora(*train_corpora, *valid_corpora)
 
     if utils.is_master(cfg) and cfg.max_steps > 0:
@@ -212,7 +217,7 @@ def run_training(
         torch.manual_seed(cfg.seed + cfg.tp_rank)
         torch.cuda.manual_seed(cfg.seed + cfg.tp_rank)
 
-    model: models.Transformer = arch_cls(cfg.model_cfg, cfg, task=task)
+    model: Transformer = arch_cls(cfg.model_cfg, cfg, task=task)
     
     if cfg.tp_size > 1:
         # with Tensor Parallelism, all ranks don't always have the exact same number of parameters, which means that
@@ -258,14 +263,17 @@ def run_training(
         for valid_corpus in valid_corpora:
             logger.info(f'loading validation set: {valid_corpus}')
             valid_set = ValidationDataset(dist_cfg=cfg, task=task, corpus=valid_corpus)
+            if cfg.metrics and valid_set.references:
+                assert all(sample['prompt_mask'].sum() > 0 for sample in valid_set.data), ('there is nothing to prompt '
+                    'the decoder with for inference, please set --bos-idx to a positive value')
             valid_sets.append(valid_set)
 
         if cfg.max_steps == 0:
             train_set = None
         else:
-            # TODO: set a dataset seed that changes when resuming training            
+            # TODO: set a dataset seed that changes when resuming training
             cfg.dataset_cfg.batch_by = cfg.dataset_cfg.batch_by or model.batch_by
-            train_set = dataset_cls(
+            train_set: TrainingDataset = dataset_cls(
                 cfg=cfg.dataset_cfg,
                 dist_cfg=cfg,
                 task=task,
@@ -324,7 +332,6 @@ def train(
     with trainer.metrics.timer('load_wall'):
         train_iterator = None if train_set is None else train_set.endless_iterator()
         train_iterator = utils.distributed_batch_iterator(train_iterator, tp_group, cfg.tp_rank)
-    patience = cfg.patience
     keep_last = cfg.keep_last if cfg.keep_last > 0 else None   # always keep at least one last checkpoint
     # (a zero or negative value means keep all)
 
@@ -340,6 +347,7 @@ def train(
             )
             pass  # skip training and saving and go straight to validation
         else:
+            task.train()  # set to training mode
             with trainer.metrics.timer('wall'):
                 trainer.train_step(train_iterator)
 
@@ -434,7 +442,7 @@ def train(
 
         utils.benchmark.reset()   # resets peak memory statistics
 
-        if patience == 0:
+        if trainer.patience == 0:
             logger.info('ran out of patience')
             break
     
@@ -480,10 +488,9 @@ def evaluate(
                 if should_decode:
                     hypotheses += trainer.inference_step(
                         batch,
-                        # TODO: allow any DecodingConfig option
-                        max_output_len=cfg.max_output_len,
-                        beam_size=cfg.beam_size,
+                        **DecodingConfig(cfg).as_dict(),
                         return_scores=cfg.verbose,
+                        stop_sequences=task.stop_sequences,
                     )
 
         hypotheses.sort(key=lambda hyp: hyp['idx'])  # sort hypotheses by their original index in the valid set
@@ -491,15 +498,18 @@ def evaluate(
         main_score = valid_metrics.rolling_divide('nll_loss', 'num_tokens')
         if utils.is_master(cfg) and hypotheses:
             for hyp in hypotheses[:5]:
-                for line in task.hypothesis_to_str(hyp, verbose=cfg.verbose).split('\n'):
-                    logger.info(f"{corpus} | example output: {line}")
+                line = task.hypothesis_to_str(hyp, verbose=cfg.verbose)
+                logger.info(f"{corpus} | example output: {line}")
 
             output_dir = os.path.join(cfg.model_dir, 'outputs')
             os.makedirs(output_dir, exist_ok=True)
             output_path = f'{corpus}.out' if trainer.steps == 0 else f'{corpus}.{trainer.steps}.out'
             output_path = os.path.join(output_dir, output_path)
             with open(output_path, 'w') as output_file:
-                output_file.writelines(f'{task.hypothesis_to_str(hyp)}\n' for hyp in hypotheses)
+                output_file.writelines(
+                    task.hypothesis_to_str(hyp, escape=True) + '\n'
+                    for hyp in hypotheses
+                )
 
         for metric in cfg.metrics:
             if not hypotheses:
@@ -512,7 +522,6 @@ def evaluate(
                     hypotheses,
                     references,
                     # TODO: allow any EvalConfig option
-                    merge_bpe=cfg.merge_bpe,
                     bleu_tok=cfg.bleu_tok,
                     eval_lc=cfg.eval_lc,
                 )
@@ -664,10 +673,6 @@ def main():
     os.makedirs(cfg.model_dir, exist_ok=True)
     with open(config_file, 'w') as file:
         yaml.safe_dump(cfg.as_dict(), file)
-
-    # Setting distributed training options
-    # ============================
-    start_device, node_size = utils.setup_distributed(cfg)
     
     # Launching processes
     # ===================
@@ -676,7 +681,12 @@ def main():
     handler = SignalHandler(status)
     ign_handler = IgnoreHandler()
     
-    while True:
+    while True:  # training can be restarted by sending SIGUSR1
+        
+        # Setting distributed training options
+        # ============================
+        start_device, node_size = utils.setup_distributed(cfg)
+
         queues = [mp.Queue(maxsize=1024) for _ in range(cfg.dp_local_size)]
         handler.restart = False
         status.run()

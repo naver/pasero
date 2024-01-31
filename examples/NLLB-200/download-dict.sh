@@ -27,3 +27,5 @@ for token in madeupword0000 madeupword0001 madeupword0002; do
 done
 
 popd
+
+cp examples/NLLB-200/inference.yaml models/NLLB-200

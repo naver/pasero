@@ -3,53 +3,48 @@
 
 import numpy as np
 import logging
+import os
 from typing import Any
-from pasero.config import TranslationTaskConfig
+from pasero.config import register_task, TranslationTaskConfig, TransformerConfig
 from pasero.tasks import Task, TranslationTask, ParallelCorpus, InferenceParallelCorpus
 
 logger = logging.getLogger('speech_translation')
 
 
+@register_task('speech_translation')
 class SpeechTranslationTask(TranslationTask):
+    cfg: TranslationTaskConfig
 
-    def __init__(self, data_dir: str, cfg: TranslationTaskConfig):
-        super().__init__(data_dir, cfg)
-        self.src_tokenizer = None  # FIXME: it is unnecessarily initialized by the call above
-
-    def set_model_type(self, model_type: str) -> None:
-        assert model_type == 'encoder_decoder'
-        super().set_model_type(model_type)
+    def setup_for_model(self, model_cfg: TransformerConfig) -> None:
+        assert model_cfg.model_type == 'encoder_decoder'
+        super().setup_for_model(model_cfg)
 
     @property
     def inference_options(self) -> dict:
         return {**super().inference_options, 'task': 'speech_translation'}
 
-    def input_to_sample(self, input: np.ndarray, meta: dict) -> dict:
+    def input_to_sample(self, input: np.ndarray, meta: dict = {}) -> dict:
         return {'source': input, 'target': None, 'meta': meta}
 
     @property
-    def encoder_num_embeddings(self):
+    def encoder_num_embeddings(self) -> int:
         return 0
-
-    @property
-    def decoder_num_embeddings(self):
-        return self.tgt_preprocessor.num_symbols
 
     @property
     def preprocessors(self):
         return {'target': self.tgt_preprocessor}
 
     def log_sample(self, sample_bin: dict) -> None:
-        target_tok = self.tgt_preprocessor.debinarize(sample_bin['target'])
-        corpus_id = sample_bin['meta']['corpus_id']
-        logger.debug(f'{corpus_id} | line example: {target_tok}')
+        # log with TranslationTask, but remove 'encoder_input' which is not text (TranslationTask handles this 
+        # edge case for decoder-only translation)
+        super().log_sample({k: v for k, v in sample_bin.items() if k != 'encoder_input'})
 
     def preprocess(
         self,
         sample: dict[str, Any],
         truncate: bool = False,
         tokenize: bool = True,
-        inference: bool = False,
+        append_eos: bool = False,
     ) -> dict[str, Any]:
         source, target = sample['source'], sample['target']
         meta = sample['meta']
@@ -60,28 +55,32 @@ class SpeechTranslationTask(TranslationTask):
         tags = self.get_target_tags(meta)
         prompt_len = len(tags)
 
-        source_bin = source[:source_cutoff]
+        encoder_input = source[:source_cutoff]
 
         target_tok = list(tags)
         if target is None:
             pass
         elif tokenize:
-            target_tok.append(self.tgt_preprocessor.tokenize(target))
+            target_tok += self.tgt_preprocessor.tokenize(target)
         else:
-            target_tok.append(target)
-        target_tok = ' '.join(target_tok)
+            target_tok += target.split()
         
-        target_bin = self.tgt_preprocessor.binarize(target_tok, max_len=target_cutoff)
-        prompt_mask = np.zeros_like(target_bin, dtype=bool)
-        prompt_mask[:prompt_len] = True
+        decoder_input = self.tgt_preprocessor.binarize(
+            target_tok,
+            max_len=target_cutoff,
+            prepend_bos=self.prepend_bos,
+            append_eos=append_eos,
+        )
+        prompt_mask = np.zeros_like(decoder_input, dtype=bool)
+        prompt_mask[:prompt_len + int(self.prepend_bos)] = True
 
-        if self.should_skip(len(source_bin), len(target_bin)):
+        if self.should_skip(len(encoder_input), len(decoder_input)):
             assert not truncate  # this shouldn't happen since we truncate
             return {}
         else:
             return {
-                'source': source_bin,
-                'target': target_bin,
+                'encoder_input': encoder_input,
+                'decoder_input': decoder_input,
                 'prompt_mask': prompt_mask,
                 'meta': meta,
             }

@@ -57,8 +57,8 @@ try:
     for line in sys.stdin:
         src_sent, tgt_sent = line.split('\t')
 
-        src_sent = src_sent.strip()
-        tgt_sent = tgt_sent.strip()
+        src_sent = src_sent.replace(tag, ' ').strip()
+        tgt_sent = tgt_sent.replace(tag, ' ').strip()
 
         if not src_sent and not tgt_sent:  # document boundaries in some corpora are set by empty lines on both sides
             if len(src_doc) >= args.min_doc_size:
@@ -77,6 +77,8 @@ try:
 
     if len(src_doc) >= args.min_doc_size:
         write_docs(src_doc, tgt_doc, outfile)
+except BrokenPipeError:
+    pass
 finally:
     if outfile is not sys.stdout:
         outfile.close()

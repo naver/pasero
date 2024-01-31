@@ -2,11 +2,13 @@ from setuptools import setup, find_packages
 
 setup(
     name='pasero',
-    version='1.0',
+    version='1.1',
     packages=find_packages(),
     install_requires=[
-        'torch>=2.0.1',
+        'torch>=2.1',
         'sacrebleu>=2.3.0',
+        'torchaudio',
+        'PySoundFile',
         'regex',
         'numpy',
         'mlflow',
@@ -15,7 +17,7 @@ setup(
         'flask',
         'waitress',
         'pyyaml',
-        'fasttext',
+        # 'fasttext',
         'matplotlib',
         'tqdm',
         'emoji',
@@ -31,6 +33,7 @@ setup(
             'pasero-decode = cli.decode:main',
             'pasero-serve = cli.serve:main',
             'pasero-serve-hf = cli.serve_hf:main',
+            'pasero-retriever = cli.retriever:main',
             # Pasero-Tokenizer actions
             'pasero-tokenize = cli.tokenizer:main_tokenize',
             'pasero-detokenize = cli.tokenizer:main_detokenize',

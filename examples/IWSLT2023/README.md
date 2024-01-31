@@ -20,7 +20,7 @@ pasero-train -c examples/IWSLT2023/taq-fr-contrastive-1.yaml -o models/iwslt2023
 
 # Decode the IWSLT 2022 Tamasheq test set with it
 pasero-decode models/iwslt2023/taq-fr-contrastive-1 -i data/iwslt2023/w2v2nima-8/tamasheq/test.npy.taq \
--r data/iwslt2023/w2v2nima-8/tamasheq/test.npy.fr --encoder-adapters default --decoder-adapters default
+-r data/iwslt2023/w2v2nima-8/tamasheq/test.fr --encoder-adapters default --decoder-adapters default
 ```
 
 In this work, we also showed that the same architecture can achieve excellent results on high-resource languages:

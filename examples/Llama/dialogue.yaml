@@ -1,0 +1,33 @@
+task: dialogue
+### Pre-trained model
+arch: mistral_7b
+ckpt: models/mistral-7b/model_bfloat16.bin  # path to a checkpoint converted to the pasero format
+# with "scripts/convert-hf-ckpt.py"
+tokenizer: hf
+tokenizer_path: mistralai/Mistral-7B-v0.1  # name or path of a HuggingFace mdoel
+dtype: bfloat16  # works on A100s or H100s (on V100s, use float16)
+### Training data
+chat_template: zephyr  # encode conversations with this template
+data_dir: data/ultrachat_200k  # see examples/Llama/README.md to download the data
+train_corpora: [train.jsonl]   # one conversation per line as json
+valid_corpora: [valid.jsonl]   # shouldn't be to big, evaluation is slow!
+decoder_max_len: 4096  # max length of a dialogue (will modify the pretrained model's max length)
+buffer_size: 10000     # number of dialogues to load and tokenize before batching
+### Training options
+batch_size: 4096      # max tokens per batch (should be at least as high as decoder_max_len)
+virtual_dp_size: 8    # simulate 8-way data parallelism (effective batch size ~4096*8 tokens)
+max_steps: 10000      # train for 10k updates (~200k dialogues)
+tp_size: 2            # 2-way tensor parallelism to reduce memory usage
+checkpoint_activations: True  # save a lot of memory by recomputing activations during the backward pass
+### Optimization
+weight_decay: 0.1
+dropout: 0
+lr: 0.00001
+adam_betas: [0.9, 0.95]
+warmup: 1000
+prompt_loss: 0  # no loss on user tokens (the model will be trained on assistant messages only)
+### Evaluation
+valid_interval: 2000         # evaluate every 2k updates
+metrics: ['bleu', 'chrf']    # remove to disable decoding during evaluation (which is very slow)
+early_stopping_metric: chrf  # use chrF to pick the best checkpoint (instead of valid perplexity)
+max_output_len: 256          # max length of the assistant answers at decoding

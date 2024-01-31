@@ -35,6 +35,8 @@ pip install -e .
 mkdir -p tmp data models  # should be on a shared filesystem
 ```
 
+Optionally install flash attention following [these steps](https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features).
+
 The examples in this README assume the existence of `data` and `models` directories, but those are not strictly necessary. However,
 Pasero will need a shared `tmp` directory located at the Pasero root to store its SLURM logs and dataset indexes.
 
@@ -63,7 +65,7 @@ examples/ParaCrawl/download.sh fr  # ParaCrawl French-English corpus
 `pasero-build-tokenizer` can be used to create BPE models and Pasero dictionaries (and also for tokenizing text with an existing model). This tokenizer is similar to SentencePiece but applies [inline casing](https://aclanthology.org/W19-5361/) by default: all subwords are lowercase, but are followed by a special token indicating their case. For instance:
 `Welcome to the US.` -> `▁welcome <T> ▁to ▁the ▁us <U> .` While this tokenizer is the default, any SentencePiece or HuggingFace tokenizer can also be used with `--tokenizer sentencepiece|hf` and `--tokenizer-path`.
 
-To train the baseline MT models in [examples](examples) (e.g., `TED/training.yaml`, `TED-top20/training.yaml`, `ParaCrawl/training.yaml`) you'll need the following BPE models.
+To train the baseline MT models in [examples](/examples) (e.g., `TED/training.yaml`, `TED-top20/training.yaml`, `ParaCrawl/training.yaml`) you'll need the following BPE models.
 Note that they are also made available in the respective examples directories (e.g., `examples/TED/de-en/bpecodes`) and automatically copied to `data` by the download scripts.
 
 #### Bilingual (TED German-English):
@@ -100,6 +102,9 @@ The dictionary format is the same as in fairseq: one token per line, optionally 
 
 To specify different ids for these special tokens, they can be manually added to the dictionary at the relevant positions (in which case, Pasero won't add them again).
 
+With `--tokenizer hf`, this dictionary is optional since the HuggingFace tokenizer's vocab will be used by default.
+HuggingFace-style dictionary files are also allowed (i.e., json format). This is automatically inferred from the file's extension: `--dict dict.txt` for a fairseq-style dictionary and `--dict dict.json` for a HuggingFace-style one.
+
 ### Other uses of the Pasero Tokenizer
 
 #### Tokenization:
@@ -114,11 +119,11 @@ pasero-detokenize < data/TED/train.tok.de > data/TED/train.detok.de
 ```bash
 pasero-build-dict < data/TED/train.tok.de > data/TED/dict.de.txt
 ```
-This command can be used to create a dictionary from an existing tokenizer (e.g., SentencePiece). The script `scripts/hf-tokenizer-to-dict.py` can also be used to generate such a dictionary from any HugginFace tokenizer.
+This command can be used to create a dictionary from an existing tokenizer (e.g., SentencePiece).
 
 ## Training models
 
-Models can be trained by creating a YAML configuration file and running `pasero-train -c CONFIG_FILE`. Some documented examples can be found in [examples](examples). The best strategy for creating a configuration is to copy a similar existing configuration and modify the relevant options.
+Models can be trained by creating a YAML configuration file and running `pasero-train -c CONFIG_FILE`. Some documented examples can be found in [examples](/examples). The best strategy for creating a configuration is to copy a similar existing configuration and modify the relevant options.
 
 All parameters already defined in a config file can be overridden by command line options. For instance `pasero-train -c CONFIG_FILE --model-dir CUSTOM_DIR` specifies a custom model directory for saving the model checkpoints.
 
@@ -130,7 +135,7 @@ If a training instance is interrupted (e.g., with CTRL+C), it will attempt to sa
 
 ### Parallelism
 
-By default, `pasero-train` will use all the available GPUs for data parallelism (i.e., each GPU holds a replica of the model and processes its own local batch, then GPUs synchronize their gradients after the backward pass). This can also be controlled with the `--dp-size` option. Other types of parallelism are also available: tensor parallelism with `--tp-size` and fully sharded data parallelism with `--dp-size` + `--fsdp`.
+By default, `pasero-train` uses all the available GPUs for data parallelism (i.e., each GPU holds a replica of the model and processes its own local batch, then GPUs synchronize their gradients after the backward pass). This can also be controlled with the `--dp-size` option. Other types of parallelism are also available: tensor parallelism with `--tp-size` and fully sharded data parallelism with `--dp-size` + `--fsdp`.
 
 Data parallelism has the effect of increasing the effective batch size: training on 4 GPUs with a batch size of 4000 tokens is equivalent to training on 1 GPU with a batch size of 16000 tokens. This batch size increase can also be simulated thanks to accumulated gradients using the `--virtual-dp-size` option. This latter option is a good way to ensure that no matter the number of GPUs used, the batch size remains constant (i.e., `--dp-size 1 --virtual-dp-size 8` and `--dp-size 8 --virtual-dp-size 8` give the same effective batch size) and the other hyper-parameters (e.g., `--lr`) can be left unchanged.
 
@@ -139,12 +144,12 @@ Data parallelism has the effect of increasing the effective batch size: training
 Training big models can be a challenge, but there are several tricks in Pasero that can reduce memory usage and enable the finetuning of large models (e.g., Llama 13B):
 
 - Reducing the maximum length of the training examples with `--max-source-len` and `--max-target-len` (for translation) or `--max-len` (for language modeling). By default they have the same value as `--encoder-max-len` and `--decoder-max-len`. Training and validation examples that are too long will be respectively skipped or truncated, which can help prevent OOMs from possible outliers.
-- Reducing the batch size (`--batch-size`). A similar batch size as before can be simulated by increasing `--virtual-dp-size` proportionally. The batch size should be at least as high than `--max-source-len` and `--max-target-len`.
-- Reducing the maximum length ratio of the training examples with `--min-len-ratio` and `--max-len-ratio` (for translation).
+- Reducing the batch size (`--batch-size`). A similar batch size as before can be simulated by increasing `--virtual-dp-size` proportionally. The batch size should be at least as high as `--max-source-len`, `--max-target-len` and `--max-len`.
+- For translation, reducing the maximum length ratio of the training examples with `--min-len-ratio` and `--max-len-ratio`.
 - Half-precision training (`--dtype float16` or `--dtype bfloat16`). `bfloat16` is more convenient than `float16` but it requires recent GPUs.
 - Activation checkpointing with `--checkpoint-activations`: this is a very easy option to activate, with no downside except a moderate decrease in training speed. This can drastically reduce memory usage, especially with large batches.
-- Reducing the size of the vocabulary and/or disabling label smoothing: large dictionaries such as those used by NLLB-200, mBART or BLOOM have an enormous memory footprint. When possible, filtering those dictionaries (especially on the target side) to only keep the relevant tokens (e.g., tokens for one specific language of interest) can improve training speed and reduce memory usage. As an example, activations with a 256k vocabulary, a batch size of 8000 tokens and label smoothing will take ~23GB or GPU memory. And sadly, activation checkpointing does not work on the loss computation.
-- Parameter-efficient finetuning with LoRA (`--lora-rank X`) or bottleneck adapters (`--arch adapter_transformer`), this is an other way to drastically reduce memory usage as the optimizer states take much more memory than the model itself. Parameter-efficient training will only store optimizer states for the parameters that are being trained.
+- Reducing the size of the vocabulary and/or disabling label smoothing: large dictionaries such as those used by NLLB-200, mBART or BLOOM have an enormous memory footprint. When possible, filtering those dictionaries (especially on the target side) to only keep the relevant tokens (e.g., tokens for one specific language of interest) can improve training speed and reduce memory usage. As an example, activations with a 256k vocabulary, a batch size of 8000 tokens and label smoothing will take ~23GB or GPU memory.
+- Parameter-efficient finetuning with LoRA (`--lora-rank X`) or bottleneck adapters (`--arch adapter_transformer`), this is an other way to drastically reduce memory usage since the optimizer states take much more memory than the model itself. Parameter-efficient training will only store optimizer states for the parameters that are being trained.
 - Tensor Parallelism (`--tp-size X`): model parallelism tailored for the Transformer. Most model parameters are sharded across GPUs and synchronizations happen before and after each Transformer block. This is combined with sequence parallelism, which reduces the memory usage of the activations outside of the attention and feed-forward blocks (embeddings, layer norms, loss) by sharding the batch. For now, tensor parallelism cannot be combined with data parallelism but larger batch sizes can be simulated with `--virtual-dp-size`.
 - Fully sharded data parallelism (`--dp-size X --fsdp`): the model and optimizer are sharded across GPUs (in a more generic way than with TP), but each GPU still processes its own batches locally like with data parallelism. This involves a lot of communication as GPUs need to retrieve the missing parameters from the other GPUs to compute their local outputs.
 
@@ -222,11 +227,11 @@ The following commands assume that a German-English TED model was trained (see [
 # Fast "evaluation" mode. Translate a German test set and evaluate against the English reference:
 pasero-decode models/TED/de-en -i data/TED/test.de -r data/TED/test.en --bleu-tok none
 
-# Same thing, but specify input and reference files by their corpus prefix (in this case, '-s' and -t' are required):
-pasero-decode models/TED/de-en -e data/TED/test -s de -t en --bleu-tok none
+# Same thing, but specify input and reference files by their corpus prefix
+pasero-decode models/TED/de-en -e data/TED/test --bleu-tok none
 
 # Line-by-line interactive decoding from standard input:
-pasero-decode models/TED/de-en -s de -t en --buffer-size 1 -v
+pasero-decode models/TED/de-en --buffer-size 1 -v
 ```
 
 The option `--buffer-size` or `-n` specifies the number of lines that should be read before decoding (default: 100). Larger values can result in larger 
@@ -239,16 +244,15 @@ convenient with the multi-aligned TED Talks dataset, which contains many empty l
 
 The option `--bleu-tok none` skips the word-tokenization of SacreBLEU, as TED test is already word-tokenized.
 
-The `--lang-code` option should be specified for multilingual models, unless those are [META AI models](#nllb-models) with target-side codes.
-
 An output file can be specified with `-o` and the `--continue` option resumes decoding if the output file already contains some lines. It comes in handy when
 decoding large datasets (e.g., backtranslation) with SLURM jobs that can be preempted.
 
 Multiple corpora can also be evaluated in a single call to `pasero-decode`:
 ```bash
-pasero-decode models/TED/top20 --lang-code -i data/TED/test.{fr,de} -r data/TED/test.{de,fr} --bleu-tok none -o test.{fr-de,de-fr}.out
+pasero-decode models/TED/top20 -i data/TED/test.{fr,de} -r data/TED/test.{de,fr} --bleu-tok none -o test.{fr-de,de-fr}.out
 ```
-The options `-i/--input`, `-r/--reference`, `-o/--output`, `-l/--lang-pairs/--langs`, and `--domains` should have the same number of arguments (or just one). In this example, `-s` and `-t` are automatically inferred from the input and reference filenames.
+In this example, since the model is multilingual, the source and target languages should be unambiguous. Here, they are inferred from the input and 
+reference filenames, but they can also be specified manually thanks to `-s/--source-lang`, `-t/--target-lang` or `-l/--lang-pairs`.
 
 More concise version:
 ```bash
@@ -263,7 +267,7 @@ Models that define the `--encoder-adapters-by` or `--decoder-adapters-by` option
 
 For instance, this will automatically load the `lang:en` encoder adapters and `lang:fr` decoder adapters:
 ```bash
-pasero-decode models/TED/top20.lang-adapters -s en -t fr --lang-code -v -n 1
+pasero-decode models/TED/top20.lang-adapters -s en -t fr -v -n 1
 ```
 
 For more precise control, or for decoding with custom adapters, the `--encoder-adapters` and `--decoder-adapters` options can be used.
@@ -293,8 +297,8 @@ model.decode('Hello, world!', source_lang='eng_Latn', target_lang='fra_Latn')
 # output:
 [[
     {
-        'src_tokens':        '<lang:en> ▁Hello , ▁world ! </s>',
-        'tokens':            '<lang:fr> ▁Bon jour , ▁le ▁monde ▁! </s>',
+        'src_tokens':        ['<lang:en>', '▁Hello', ',', '▁world', '!', '</s>'],
+        'tokens':            ['<lang:fr>', '▁Bon jour', ',', '▁le', '▁monde', '▁!', '</s>'],
         'detok':             'Bonjour, le monde !'
         'score':             array(8.766, dtype=float16),
         'normalized_score':  array(0.974, dtype=float16),
@@ -329,13 +333,13 @@ hyp = nbest[0]  # top beam search candidate for the first input
 from pasero import utils
 # Plot the cross-attention at the 6th decoder layer for the first translation:
 utils.heatmap(
-    hyp['src_tokens'].split(),
-    hyp['tokens'].split(),
+    hyp['src_tokens'],
+    hyp['tokens'],
     hyp['dec_5_cross_attn'][:,-1],  # last attention head
 )
 ```
 
-![attn](https://media.oss.navercorp.com/user/9696/files/847c72d5-cfc0-42e5-995d-f10450ae982a)
+![attn](attention.jpeg)
 
 Entire test sets can also be decoded (and optionally evaluated):
 ```python
@@ -388,13 +392,13 @@ Some options, like `beam_size` or `max_output_len` can also be modified 'on-the-
 
 Pasero provides a simple program for serving models through an HTTP API or a Web interface.
 
-For instance, to deploy [NLLB-200](https://github.com/facebookresearch/fairseq/tree/nllb), [Zephyr 7B Beta](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta) (a [Mistral 7B](https://huggingface.co/mistralai/Mistral-7B-v0.1) finetuned on chat) and [Llama 2 7B](https://huggingface.co/meta-llama/Llama-2-13b-hf):
+For instance, to deploy [NLLB-200](https://github.com/facebookresearch/fairseq/tree/nllb), [Mistral 7B Instruct](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2) and [Llama 2 13B](https://huggingface.co/meta-llama/Llama-2-13b-hf):
 ```bash
-pasero-serve models/NLLB-200/3.3B_dense.bin:0 models/zephyr-7b-beta:1 models/llama-2-7b:2 --port 8000
+pasero-serve models/NLLB-200/3.3B_dense.bin:0 models/mistral-7b-instruct:1 models/llama-2-13b:2 --port 8000
 ```
-In this example, NLLB-200 is launched on the first GPU, Zephyr on the second GPU and Llama on the third GPU. All three directories will
+In this example, NLLB-200 is launched on the first GPU, Mistral on the second GPU and Llama on the third GPU. All three directories will
 have to contain an `inference.yaml` file specifying the decoding options and model architecture, and a checkpoint and dict in the Pasero format.
-See their respective READMEs ([NLLB-200](examples/NLLB-200/README.md), [Llama 2 / Zephyr](examples/Llama/README.md)) to find how to download and convert these three models.
+See their respective READMEs ([NLLB-200](examples/NLLB-200/README.md), [Llama 2 / Mistral](examples/Llama/README.md)) to find how to download and convert these three models.
 
 The web interface can be accessed at http://HOST:8000 where HOST is "localhost" if running locally, or the name or IP of your server if running remotely:
 

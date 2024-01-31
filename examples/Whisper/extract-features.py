@@ -57,7 +57,8 @@ parser.add_argument('--padding', default=True, action=argparse.BooleanOptionalAc
 @functools.lru_cache(3)  # saves a lot of time when multiple consecutive segments are from the same large audio file
 def load_audio(path: str, sampling_rate: int):
     waveform, sampling_rate_ = torchaudio.load(path)
-    waveform = torchaudio.functional.resample(waveform, sampling_rate_, sampling_rate)
+    if waveform.size(1) > 0:
+        waveform = torchaudio.functional.resample(waveform, sampling_rate_, sampling_rate)
     waveform = waveform.mean(dim=0)
     return waveform
 

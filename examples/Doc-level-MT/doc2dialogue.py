@@ -44,6 +44,8 @@ try:
         
         print(json.dumps(conversation), file=outfile)
     pass
+except BrokenPipeError:
+    pass
 finally:
     if outfile is not sys.stdout:
         outfile.close()

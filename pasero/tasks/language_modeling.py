@@ -6,7 +6,7 @@ import numpy as np
 import logging
 from typing import Optional, Any
 from pasero.utils import defined
-from pasero.config import LanguageModelingTaskConfig
+from pasero.config import register_task, LanguageModelingTaskConfig, TransformerConfig
 from pasero.preprocessing import TextPreprocessor, get_domain_tag, get_lang_code
 from pasero.tasks import Task, Corpus, InferenceCorpus
 
@@ -70,6 +70,7 @@ class InferenceMonolingualCorpus(InferenceCorpus, MonolingualCorpus):
         self.output_path = output_path
     
 
+@register_task('language_modeling')
 class LanguageModelingTask(Task):
     cfg: LanguageModelingTaskConfig
 
@@ -79,7 +80,7 @@ class LanguageModelingTask(Task):
         cfg: LanguageModelingTaskConfig,
     ):
         super().__init__(data_dir, cfg)
-        self.tgt_preprocessor = TextPreprocessor(cfg, data_dir)
+        self.preprocessor = TextPreprocessor(cfg, data_dir)
         self.langs = set(cfg.langs or [])
         self.domains = set(cfg.domains or [])
         self.check_tags()
@@ -117,10 +118,10 @@ class LanguageModelingTask(Task):
             assert meta['lang'] in self.langs, 'this language is not covered by the model'
         if meta.get('domain') is not None:
             assert meta['domain'] in self.domains, 'this domain is not covered by the model'
-
-    def set_model_type(self, model_type: str) -> None:
-        assert model_type == 'decoder'
-        super().set_model_type(model_type)
+    
+    def setup_for_model(self, model_cfg: TransformerConfig) -> None:
+        assert model_cfg.model_type == 'decoder'
+        super().setup_for_model(model_cfg)
 
     @property
     def task_info(self) -> dict:
@@ -138,7 +139,7 @@ class LanguageModelingTask(Task):
 
     @property
     def inference_options(self) -> dict:
-        options = {**self.tgt_preprocessor.inference_options, 'task': 'language_modeling'}
+        options = {**self.preprocessor.inference_options, 'task': 'language_modeling'}
         
         for name in 'lang_code', 'domain_tag', 'max_len', 'tags':
             value = getattr(self.cfg, name)
@@ -150,32 +151,33 @@ class LanguageModelingTask(Task):
 
         return options
 
-    def input_to_sample(self, input: str, meta: dict) -> dict:
+    def input_to_sample(self, input: str, meta: dict = {}) -> dict:
         return {'target': input, 'meta': meta}
 
     @property
-    def encoder_num_embeddings(self):
+    def encoder_num_embeddings(self) -> int:
         return 0
 
     @property
-    def decoder_num_embeddings(self):
-        return self.tgt_preprocessor.num_symbols
+    def decoder_num_embeddings(self) -> int:
+        return self.preprocessor.num_symbols
 
     @property
-    def preprocessors(self):
-        return {'target': self.tgt_preprocessor}
+    def preprocessors(self) -> dict[str, TextPreprocessor]:
+        return {'target': self.preprocessor}
 
     def log_sample(self, sample_bin: dict) -> None:
-        target_tok = self.tgt_preprocessor.debinarize(sample_bin['target'], keep_padding=True)
+        decoder_input = self.preprocessor.debinarize(sample_bin['decoder_input'])
+        decoder_input = ' '.join(decoder_input)
         corpus_id = sample_bin['meta']['corpus_id']
-        logger.debug(f'{corpus_id} | line example: {target_tok}')
+        logger.debug(f'{corpus_id} | line example: {decoder_input}')
 
     def get_reference(self, sample: dict[str, Any]):
         return None
 
     def check_tags(self):
         """ Check that the dictionaries contain all the necessary lang codes and domain tags """
-        dict = self.tgt_preprocessor.dictionary
+        dict = self.preprocessor.dictionary
         
         if self.cfg.domain_tag:
             for domain in self.domains:
@@ -204,7 +206,7 @@ class LanguageModelingTask(Task):
         sample: dict[str, Any],
         truncate: bool = False,
         tokenize: bool = True,
-        inference: bool = False,
+        append_eos: bool = False,
     ) -> dict[str, Any]:
         target = sample['target']
         meta = sample['meta']
@@ -217,21 +219,27 @@ class LanguageModelingTask(Task):
         if not target:
             pass
         elif tokenize:
-            target_tok.append(self.tgt_preprocessor.tokenize(target))
+            target_tok += self.preprocessor.tokenize(target)
         else:
-            target_tok.append(target)
-        target_tok = ' '.join(target_tok)
+            target_tok += target.split()
         
-        target_bin = self.tgt_preprocessor.binarize(target_tok, max_len=cutoff, truncate_left=True)
-        prompt_mask = np.zeros_like(target_bin, dtype=bool)
-        prompt_mask[:prompt_len] = True
+        decoder_input = self.preprocessor.binarize(
+            target_tok,
+            max_len=cutoff,
+            truncate_left=True,
+            prepend_bos=self.prepend_bos,
+            append_eos=append_eos,
+        )
+        
+        prompt_mask = np.zeros_like(decoder_input, dtype=bool)
+        prompt_mask[:prompt_len + int(self.prepend_bos)] = True
 
-        if len(target_bin) > self.max_len:
+        if len(decoder_input) > self.max_len:
             assert not truncate  # this shouldn't happen since we truncate
             return {}
         else:
             return {
-                'target': target_bin,
+                'decoder_input': decoder_input,
                 'prompt_mask': prompt_mask,
                 'meta': meta,
             }

@@ -1,28 +1,31 @@
-data_dir: data/Doc-level
-arch: transformer_big
-batch_size: 8192
-virtual_dp_size: 32
+data_dir: data/Doc-level  # path to the data downloaded with 'download.sh'
+arch: transformer_big     # encoder-decoder architecture
+batch_size: 8192          # max tokens per batch, should be at least as high as decoder_max_len * tp_size
+virtual_dp_size: 32       # simulate training with data parallelism on 32 GPUs by accumulating gradients
 init_lr: 1.0e-07
-lr: 0.001
+lr: 0.001                 # maximum learning rate at the end of warmup
 adam_betas: [0.9, 0.98]
-max_steps: 120000
-save_interval: 1000
-valid_interval: 1000
+max_steps: 120000         # train for this many updates
+save_interval: 1000       # save a checkpoint every 1k updates
+valid_interval: 1000      # evaluate on the valid corpora (compute PPL and BLEU) every 1k steps
 
 task: doc_level_translation
 lang_pairs: [en-fr]
-max_doc_size: 10
-sent_merge_prob: 0.1
-encoder_max_len: 512
-decoder_max_len: 512
-max_output_len: 500
-sent_sep: "<sep>"
+max_doc_size: 10          # randomly group consecutive training sentences in 'fake' documents of 1 to 10 sentences (uniformly)
+sent_merge_prob: 0.1      # randomly merge every two consecutive sentences into a single sentence (without a delimiter)
+encoder_max_len: 512      # maximum length of a source document (in tokens)
+decoder_max_len: 512      # maximum length of a target document (in tokens), set to 1024 for decoder-only architectures
+max_output_len: 500       # maximum number of generated tokens at evaluation
+sent_sep: "<sep>"         # separator between sentences in a document after tokenization (should be in the dictionary)
 
-train_corpora:
+train_corpora:  # list of corpora with one sentence per line, but ordered (i.e., sentences from the same document are
+  # consecutive)
   - paths: ['news-commentary.{pair}', 'TED2020.{pair}', 'europarl.{pair}', 'OpenSubtitles.{pair}']
 
-valid_corpora:
+valid_corpora:  # contrary to train corpora, these are not merged into "fake" documents. They are either sent-level
+  # corpora or doc-level corpora with one document per line (whose sentences are separated with "<sep>")
   - paths: ['newstest2014.{pair}']  # doc-level with max 2 sentences as context
     early_stopping: True
   - paths: ['FLORES-valid']  # sent-level
-    early_stopping: False
+    early_stopping: False    # just for comparison with other training recipes (e.g., 'examples/ParaCrawl'), but not
+    # used for picking the best checkpoint or patience

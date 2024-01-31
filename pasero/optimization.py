@@ -58,6 +58,10 @@ class Adam(torch.optim.AdamW):
     Version of Adam copied from fairseq, which automatically converts float16 tensors to float32
     before updating its statistics (AKA --memory-efficient-fp16)
     """
+    def __init__(self, *args, optimizer_states_as_fp32: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.optimizer_states_as_fp32 = optimizer_states_as_fp32
+
     @torch.no_grad()
     def step(self, closure=None):
         """ Copied from fairseq/optim/adam.py """
@@ -79,7 +83,13 @@ class Adam(torch.optim.AdamW):
                 amsgrad = group.get("amsgrad", False)
 
                 p_data_fp32 = p.data
-                if p.data.dtype is torch.float16:
+                # See section C2 of the "Training Gopher" paper (https://arxiv.org/abs/2112.11446): storing the 
+                # optimizer states in float32 can give better results by allowing small-scale updates (which would 
+                # otherwise be rounded to zero).
+                # On the other hand, this paper "https://arxiv.org/abs/2310.18313" suggests to keep the "master weights"
+                # in full precision and the gradients and optimizer statistics in lower precision. This would use less 
+                # memory.
+                if self.optimizer_states_as_fp32 and p.data.dtype in {torch.float16, torch.bfloat16}:
                     p_data_fp32 = p_data_fp32.float()
 
                 state = self.state[p]
@@ -154,7 +164,7 @@ class Adam(torch.optim.AdamW):
                 self.state[param] = v
 
 
-class FP16Adam(torch.optim.AdamW):
+class MixedPrecisionAdam(Adam):
     """
     Partially copied from fairseq.
     
@@ -172,19 +182,11 @@ class FP16Adam(torch.optim.AdamW):
     Note that the "exp_avg" and "exp_avg_sq" statistics are only created at the first optimizer
     step. So OOM errors might manifest after the forward and backward pass or only at the second forward pass.
     """
-    def __init__(
-        self,
-        params: list[Float16Parameter],
-        lr: float = 1e-3,
-        betas=(0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0.0,
-        amsgrad: bool = False,
-    ):
+    def __init__(self, params: list[Float16Parameter], *args, **kwargs):
         self.fp16_params = params
         self.param_sizes = [p.numel() for p in params]
         self.fp32_params = self.build_fp32_params(params)
-        super().__init__(self.params, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
+        super().__init__(self.params, *args, **kwargs)
 
     @classmethod
     def build_fp32_params(cls, params: list[Float16Parameter]) -> list[Float32Parameter]:
@@ -218,7 +220,7 @@ class FP16Adam(torch.optim.AdamW):
         return self.fp32_params
 
 
-class FlatFP16Adam(FP16Adam):
+class FlatFP16Adam(MixedPrecisionAdam):
     """
     Partially copied from fairseq.
     
@@ -226,7 +228,7 @@ class FlatFP16Adam(FP16Adam):
     After the backward pass, the float16 gradients are converted to float32; an optimization step is done on the 
     float32 parameter copy; and the updated parameters are converted back to float16.
     
-    This can reach higher peak memory usage than FP16Adam because the Adam computation needs to build
+    This can reach higher peak memory usage than MixedPrecisionAdam because the Adam computation needs to build
     several intermediate tensors with the same size as the entire model.
     """
     @classmethod

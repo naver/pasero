@@ -12,9 +12,9 @@ mkdir -p ${DATA_DIR}/raw
 pushd ${DATA_DIR}/raw
 
 wget https://opus.nlpl.eu/download.php?f=OpenSubtitles/v2018/moses/en-fr.txt.zip -O OpenSubtitles.en-fr.txt.zip
-unzip OpenSubtitles.en-fr.txt.zip
+unzip -o OpenSubtitles.en-fr.txt.zip
 wget https://opus.nlpl.eu/download.php?f=TED2020/v1/moses/en-fr.txt.zip -O TED2020.en-fr.txt.zip
-unzip TED2020.en-fr.txt.zip 
+unzip -o TED2020.en-fr.txt.zip
 
 wget https://data.statmt.org/news-commentary/v16/training/news-commentary-v16.en-fr.tsv.gz
 gunzip news-commentary-v16.en-fr.tsv.gz
@@ -31,8 +31,9 @@ popd
 # filter the corpora to remove any line pair in the wrong language, normalize the whitespaces and remove empty lines
 for corpus in news-commentary europarl TED2020 OpenSubtitles; do
     scripts/filter-corpus.py ${DATA_DIR}/raw/${corpus}.en-fr.{en,fr} \
-    --actions clean langid -o ${DATA_DIR}/${corpus}.en-fr.{en,fr} -v
+    --actions clean langid -o ${DATA_DIR}/${corpus}.en-fr.{en,fr} -v --langs eng_Latn fra_Latn &
 done
+wait
 
 cp examples/ParaCrawl/fr-en/{dict.txt,bpecodes} ${DATA_DIR}
 

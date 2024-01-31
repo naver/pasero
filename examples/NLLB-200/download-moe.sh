@@ -44,8 +44,6 @@ rmdir model_moe_54b
 
 # retrieve the expert ids for lang-specific pruning
 wget https://raw.githubusercontent.com/naver/nllb-pruning/main/experts.json
-cp examples/NLLB-200/inference.yaml .
-
 popd
 
 # download the NLLB tokenizer files

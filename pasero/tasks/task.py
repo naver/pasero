@@ -7,17 +7,17 @@ import torch
 import functools
 import logging
 import argparse
+import json
 from torch import nn, Tensor, LongTensor
 from typing import Optional, Any, Iterable, Iterator
 from pasero import utils, evaluation
-from pasero.utils import mask_to_len, tokens_as_tensor, SpecialTokens
-from pasero.config import TaskConfig, TransformerConfig, get_model_config
+from pasero.utils import mask_to_len, tokens_as_tensor
+from pasero.config import TaskConfig, TransformerConfig, get_model_config_cls
 from pasero.preprocessing import TextPreprocessor
 from pasero.files import File
-from pasero.tokenizers import detokenize
 
 
-logger = logging.getLogger('translation')
+logger = logging.getLogger('task')
 
 
 class Corpus:
@@ -30,7 +30,7 @@ class Corpus:
     files, read line tuples from them and send those to `Task.preprocess` and `Task.collate`.
 
     The `tuple_to_dict` method converts line tuples as read from those files into a dictionary (aka "sample") that can
-    be understood by the right task.
+    be understood by the right task. These dictionary samples will be sent to `Task.preprocess`
 
     Each type of task will typically have its own corpus subclass (e.g., TranslationTask -> ParallelCorpus, 
     LanguageModelingTask -> MonolingualCorpus, etc.)
@@ -51,7 +51,18 @@ class Corpus:
     ):
         self.paths = paths
         self.langs = langs or [path.split('.')[-1] for path in paths]
-        self.file_formats = file_formats or ['txt'] * len(paths)
+
+        if file_formats:
+            self.file_formats = file_formats
+        else:
+            self.file_formats = [
+                'jsonl' if path and 'jsonl' in os.path.basename(path).split('.')[1:]  # e.g., "valid.jsonl" or
+                # "train.fr-en.jsonl.en"
+                else 'txt' for path in paths
+            ]
+            # Note jsonl files can contain strings, not necessarily lists or dicts. This is a way to escape 
+            # strings containing line breaks:
+            # for string in strings: print(json.dumps(string))
         assert len(self.langs) == len(self.paths)
         assert len(self.file_formats) == len(self.paths)
         assert len(self.paths) >= 1
@@ -69,6 +80,9 @@ class Corpus:
         """
         Used in `datasets` to open the files described by this corpus. If `store_files_under` is set, the content of 
         files whose size in bytes does not exceed this value is saved in memory.
+
+        The returned files depend on the corpus file formats: `'txt' -> File`, `'numpy' -> NumpyFile`,
+        `'jsonl' -> 'JSONLFile'`
         """
         return [
             File.open(path, format=format, store_files_under=store_files_under)
@@ -133,10 +147,10 @@ class Corpus:
     def tuple_to_dict(self, tuple_: tuple) -> dict[str, Any]:
         """
         Convert an example represented as a tuple, such as obtained by reading this corpus' files in parallel (with zip)
-        into a dictionary example that can be understood by the relevant task.
+        into a dictionary example that can be understood by the relevant task (i.e., by `Task.preprocess`)
         For instance, for ParallelCorpus/TranslationTask, this would be do:
 
-        `(first, second)` => `{'source':first, 'target': second}`
+        `(first, second)` => `{'source': first, 'target': second}`
         """
         raise NotImplementedError
 
@@ -193,7 +207,7 @@ class Task:
     Handles the corpora and pre-processing (tokenization, batching), evaluation and logging for a given task.
     """
     # Subclasses should define those as attributes or properties:
-    tgt_preprocessor: TextPreprocessor  # text generation tasks should all have a target preprocessor (and optionally 
+    preprocessor: TextPreprocessor  # text generation tasks should all have a target preprocessor (and optionally 
     # a source one)
     preprocessors: dict[str, TextPreprocessor]
     model_type: str  # encoder_decoder or decoder
@@ -205,6 +219,8 @@ class Task:
         self.training = False
         self.data_dir = data_dir
         self.freeze_encoder_embed_mask = None  # used in Transformer & defined in TranslationTask
+        self.find_unused_parameters = False  # for training, when all batches do not use the same parameters (e.g., 
+        # lang-specific modules). Can be changed in subclasses
 
     def register_corpora(self, *corpora: Corpus) -> None:
         """ Add the languages or domains of the given corpora to the task. """
@@ -223,11 +239,23 @@ class Task:
         """ Check whether the languages and domains specified in the dictionary are supported by the current task. """
         raise NotImplementedError
 
-    def set_model_type(self, model_type: str) -> None:
-        # This is not done in __init__ because the type of model might not be known yet when creating the task
-        # (at inference, model checkpoints are loaded later)
-        self.model_type = model_type
-    
+    def setup_for_model(self, model_cfg: TransformerConfig) -> None:
+        """
+        Finish setting up the task using the model's configuration (e.g., set the model type and special tokens).
+
+        This is not done in __init__ because the model might not be known yet when creating the task
+        (at inference, model checkpoints are loaded later).
+        """
+        self.model_type = model_cfg.model_type
+        for preprocessor in self.preprocessors.values():
+            for property in 'unk_idx', 'bos_idx', 'padding_idx', 'eos_idx':
+                if getattr(preprocessor, property) != getattr(model_cfg, property):
+                    utils.warn_once(
+                        logger,
+                        f"The tokenizer has a different '{property}' than the model, modifying its value",
+                    )
+                    setattr(preprocessor, property, getattr(model_cfg, property))
+
     @property
     def task_info(self) -> dict:
         """
@@ -244,7 +272,7 @@ class Task:
         """
         raise NotImplementedError
 
-    def input_to_sample(self, input: str, meta: dict) -> dict:
+    def input_to_sample(self, input: str, meta: dict = {}) -> dict:
         """
         Called at inference to convert user inputs to samples that can be preprocessed and batched under this 
         task. Some tasks may interpret string inputs as a source to feed an encoder with, or as a prompt for a decoder.
@@ -252,26 +280,26 @@ class Task:
         raise NotImplementedError
 
     @property
-    def special_tokens(self) -> SpecialTokens:
-        return self.tgt_preprocessor.special_tokens
-    @property
     def eos_idx(self) -> int:
-        return self.special_tokens.eos_idx
+        return self.preprocessor.eos_idx
     @property
     def padding_idx(self) -> int:
-        return self.special_tokens.padding_idx
+        return self.preprocessor.padding_idx
     @property
-    def bos_idx(self) -> int:
-        return self.special_tokens.bos_idx
+    def bos_idx(self) -> Optional[int]:
+        return self.preprocessor.bos_idx
+    @property
+    def prepend_bos(self) -> bool:
+        return self.bos_idx is not None and self.bos_idx >= 0
     @property
     def unk_idx(self) -> int:
-        return self.special_tokens.unk_idx
+        return self.preprocessor.unk_idx
     @property
     def blacklist(self) -> list[int]:
-        return self.tgt_preprocessor.blacklist
+        return self.preprocessor.blacklist
     @property
-    def stop_sequences(self) -> list[LongTensor]:
-        return self.tgt_preprocessor.stop_sequences
+    def stop_sequences(self) -> LongTensor:
+        return self.preprocessor.bin_stop_sequences
 
     @property
     def encoder_num_embeddings(self) -> int:
@@ -322,9 +350,9 @@ class Task:
     
     def count_oov(self, sample_bin: dict) -> tuple[int, int]:
         """ Count the number of OOV and total tokens in given sample. """
-        if 'target' in sample_bin:
-            total = (sample_bin['target'] != self.padding_idx).sum()
-            oov = (sample_bin['target'] == self.unk_idx).sum() if self.unk_idx != self.padding_idx else 0
+        if 'decoder_input' in sample_bin:
+            total = (sample_bin['decoder_input'] != self.padding_idx).sum()
+            oov = (sample_bin['decoder_input'] == self.unk_idx).sum() if self.unk_idx != self.padding_idx else 0
             return oov, total
         else:
             return 0, 0
@@ -334,7 +362,7 @@ class Task:
         sample: dict[str, Any],
         truncate: bool = False,
         tokenize: bool = True,
-        inference: bool = False,
+        append_eos: bool = False,
     ) -> dict[str, Any]:
         """
         Takes a raw sample (e.g., a line pair in TranslationTask), tokenizes and binarizes it using the task's
@@ -347,19 +375,15 @@ class Task:
         Args:
             sample: dictionary corresponding to a single example that should be processed. Should contain at least 
                 'target' (groundtruth for the decoder) and 'meta' (information about this example, like its language).
+                It is created by the `tuple_to_dict` method of this task's corpora.
             truncate: whether to truncate examples that are too long
             tokenize: whether the text data should be tokenized
-            inference: True when this method is called with inference inputs (by TextGenerator). The target may be 
-                processed differently when it is intended for prompting rather than teacher forcing (e.g., no end of
-                sequence symbols).
+            append_eos: whether to add end of sequence tokens to the decoder input (e.g., at training or for teacher
+                forcing at inference)
 
         Returns: a dict with binary data (numpy arrays) that can be given as input, along with other dicts, to
-            `collate` to build batches of several examples. Should have at least 'target', 'prompt_mask' and 'meta'
-            fields, and optionally a 'source' field (and more if the subclass's collater supports it).
-            
-            Note that the default collater will build the decoder input by shifting the target by one position to the 
-            right and dropping its last token. So the last target token should either be EOS, or not important. This 
-            is particularly important at inference, where the decoder input will be used for prompting.
+            `collate` to build batches of several examples. Should have at least 'decoder_input', 'prompt_mask' and 
+            'meta' fields, and optionally an 'encoder_input' field (and more if the subclass's collater supports it).
         """
         raise NotImplementedError
 
@@ -376,27 +400,27 @@ class Task:
         2) detokenizing (i.e., sequence of text tokens -> sequence of words)
         3) adding any other useful information (e.g., tokenized source) extracted from `sample_bin`
         """
-        prompt_len = utils.mask_to_len(sample_bin['decoder_input'] != self.padding_idx) - 1  # remove 1 because 
-        # the output does not include decoder_input's BOS
+        prompt_len = utils.mask_to_len(sample_bin['decoder_input'] != self.padding_idx) - 1
+        # remove 1 because the output does not include decoder_input's BOS
+
+        hypothesis['prompt_tokens'] = self.preprocessor.debinarize(sample_bin['decoder_input'])
 
         tokens = hypothesis['tokens'].tolist()
         
         prompt_tokens = tokens[:prompt_len]
-        prompt_tokens = self.tgt_preprocessor.debinarize(prompt_tokens, keep_padding=True)  # keeps EOS and tokens that
-        # are after it (some chat templates may contain EOS in their prompt and we don't want to cut their outputs
-        # in the middle of the prompt)
+        prompt_tokens = self.preprocessor.debinarize(prompt_tokens)
         
         new_tokens = tokens[prompt_len:]
-        new_tokens = self.tgt_preprocessor.debinarize(new_tokens)
+        new_tokens = self.preprocessor.debinarize(new_tokens)
         
-        tokens = ' '.join([prompt_tokens, new_tokens]).strip(' ')
+        tokens = prompt_tokens + new_tokens
         hypothesis['tokens'] = tokens
 
         if self.cfg.strip_prompt:  # remove the prompt tokens from the output before detokenizing
             tokens = new_tokens
         
         hypothesis['detok'] = (
-            self.tgt_preprocessor.detokenize(tokens) if detokenize else
+            self.preprocessor.detokenize(tokens) if detokenize else
             hypothesis['tokens']
         )
 
@@ -452,7 +476,7 @@ class Task:
               langs: [some_langs]
               domain: some_domain
               ...
-        ```   
+        ```
 
         Note that corpora do not actually contain data, but paths and metadata that let datasets (
         `datasets.ValidationDataset` and `datasets.TrainingDataset`) find the relevant files, open them and read
@@ -496,11 +520,11 @@ class Task:
         """
         raise NotImplementedError
 
-    def get_collate_fn(self, dtype: str):
+    def get_collate_fn(self, dtype: torch.dtype):
         return functools.partial(
             self.collate,
-            special_tokens=self.special_tokens,
-            dtype=getattr(torch, dtype),
+            padding_idx=self.padding_idx,
+            dtype=dtype,
             model_type=self.model_type,
         )
 
@@ -508,27 +532,22 @@ class Task:
     def collate(
         cls,
         batch: list[dict],
-        special_tokens: SpecialTokens,
+        padding_idx: int,
         dtype: torch.dtype,
         model_type: str,
     ) -> dict:
         """
-        Create a padded batch from given a list of (binary) samples with variable sequence lengths.
-        
-        Also adds a "decoder_input" field, which is the target sequence shifted by one position (EOS is removed and BOS
-        is added).
+        Create a padded batch from given a list of (binary) samples with variable sequence lengths, such as returned by
+        `preprocess()`
         """
         if not batch:
             return None
 
-        targets = [sample['target'] for sample in batch]
-        target_batch, target_length = tokens_as_tensor(targets, special_tokens, dtype=dtype)
-        
+        decoder_input = [sample['decoder_input'] for sample in batch]
+        indices = torch.tensor([sample['index'] for sample in batch])
+        decoder_input, _ = tokens_as_tensor(decoder_input, padding_idx=padding_idx, dtype=dtype)
         prompt_masks = [sample['prompt_mask'] for sample in batch]
-        
-        decoder_input, _ = tokens_as_tensor(targets, special_tokens, shift=True, dtype=dtype)
-        # TODO: if special_tokens.bos_idx is None, shift decoder_input and target by one position
-        prompt_mask, _ = tokens_as_tensor(prompt_masks, special_tokens, dtype=dtype)
+        prompt_mask, _ = tokens_as_tensor(prompt_masks, padding_idx=padding_idx, dtype=dtype)
         # map prompt mask to prompt length, examples:
         # [1, 1, 1, 0, 0] -> 3
         # [1, 0, 1, 1, 0] -> 4
@@ -536,23 +555,19 @@ class Task:
         # except the last answer of the assistant would be the prompt. Note that this prompt length is used at 
         # evaluation, where it wouldn't make sense to ask for the model to generate user tokens. For computing the 
         # training loss, the more finegrained "prompt_mask" is used.
-        prompt_length = mask_to_len(prompt_mask) + 1    # add one because prompt_mask doesn't account for BOS
-        # prompt_mask[:,1:] = prompt_mask[:,:-1].clone()  # shift like 'decoder_input'
-        # TODO: assert that prompt_length >= 1 (we need something to feed the decoder with)
-
+        prompt_length = mask_to_len(prompt_mask)
         meta = batch[0]['meta']
         # Only keep info that is common to all samples in the batch, which should be the case if --batch-by is set 
         # correctly. We do this to avoid silent errors later, where samples could be attributed to the wrong language or 
         # domain
         meta = {k: v for k, v in meta.items() if all(sample['meta'].get(k) == v for sample in batch[1:])}
         return {
-            'target': target_batch,
             'decoder_input': decoder_input,
-            'target_length': target_length,
             # assumes all samples in the batch share the same metadata (use --batch-by to ensure this is the case)
             'meta': meta,
             'prompt_mask': prompt_mask,
             'prompt_length': prompt_length,
+            'indices': indices,
         }
 
     def build_batches(
@@ -560,33 +575,39 @@ class Task:
         data: list[dict],
         shuffle: bool = True,
         sort: bool = True,
-    ) -> list[list[int]]:
+        batch_size: Optional[int] = None,  # overrides cfg.batch_size
+    ) -> list[list[dict]]:
         """
-        Sort given samples by length and generate batches under given constraints. The returned batches are only lists
-        of indices in `data`.
+        Sort given samples by length and generate batches under given constraints. The samples that are put in batches 
+        are removed from the list. Some samples may remain if the last batch does not follow the batching constraints.
         """
         if self.model_type == 'encoder_decoder':
-            source_length = np.array([len(sample['source']) for sample in data])
-            target_length = np.array([len(sample['target']) for sample in data])
-            length = np.maximum(source_length, target_length)
+            encoder_length = np.array([len(sample['encoder_input']) for sample in data])
+            decoder_length = np.array([len(sample['decoder_input']) for sample in data])
+            length = np.maximum(encoder_length, decoder_length)
             indices = np.random.permutation(len(data)) if shuffle else np.arange(len(data))
             if sort:
-                indices = indices[np.argsort(target_length[indices], kind='stable')]
-                indices = indices[np.argsort(source_length[indices], kind='stable')]
+                indices = indices[np.argsort(decoder_length[indices], kind='stable')]
+                indices = indices[np.argsort(encoder_length[indices], kind='stable')]
         elif self.model_type == 'decoder':
-            length = np.array([len(sample['target']) for sample in data])
+            length = np.array([len(sample['decoder_input']) for sample in data])
             indices = np.random.permutation(len(data)) if shuffle else np.arange(len(data))
             if sort:
                 indices = indices[np.argsort(length[indices], kind='stable')]
         else:
             raise NotImplementedError
-        return utils.build_batches(
+        
+        batch_indices = utils.build_batches(
             indices,
             length.__getitem__,
-            self.cfg.batch_size,
+            batch_size or self.cfg.batch_size,
             self.cfg.batch_size_multiple,
             self.cfg.lines_per_batch,
         )
+        return [
+            [{**data[i], 'index': i} for i in indices]
+            for indices in batch_indices
+        ]
 
     @classmethod
     def shard_batch(cls, batch: dict, shard_id: int = 0, shard_count: int = 1):
@@ -626,18 +647,17 @@ class Task:
     def debinarize_on_the_fly(self, token_ids: Iterable[int]) -> Iterator[str]:
         """ See `TextPreprocessor.debinarize` """
         for token_id in token_ids:
-            yield self.tgt_preprocessor.debinarize([token_id], keep_padding=True)
+            yield from self.preprocessor.debinarize([token_id])
         
     def detokenize_on_the_fly(self, tokens: Iterable[str]) -> Iterator[tuple[str, list[str]]]:
         """ See `TextPreprocessor.detokenize_on_the_fly` """
-        yield from self.tgt_preprocessor.detokenize_on_the_fly(tokens)
+        yield from self.preprocessor.detokenize_on_the_fly(tokens)
 
     def compute_score(
         self,
         metric: str,
         hypotheses: list[dict[str, Any]],
         references: list[str],
-        merge_bpe: bool = False,
         **eval_opts,
     ) -> Optional[float]:
         """
@@ -648,11 +668,7 @@ class Task:
         For instance, `DocumentLevelTranslationTask` computes its metrics on the last sentence of each generated 
         document.
         """
-        hypotheses = [hyp['detok'] for hyp in hypotheses]
-        if merge_bpe:  # assumes there is no target tokenizer: the evaluation references and training targets are 
-            # pre-tokenized
-            hypotheses = [detokenize(hyp) for hyp in hypotheses]
-            references = [detokenize(ref) for ref in references]
+        hypotheses = [self.hypothesis_to_str(hyp) for hyp in hypotheses]
         return evaluation.safe_score(
             metric=metric,
             hyps=hypotheses,
@@ -660,7 +676,7 @@ class Task:
             **eval_opts,
         )
     
-    def hypothesis_to_str(self, hypothesis: dict, verbose: bool = False) -> str:
+    def hypothesis_to_str(self, hypothesis: dict, verbose: bool = False, escape: bool = False) -> str:
         """
         Converts a decoding hypothesis represented as a dict, into a string that can be printed on the screen or 
         written into a text file.
@@ -669,20 +685,25 @@ class Task:
         `Task.hypothesis_to_str` is generic and works with TranslationTask, SpeechTranslationTask and 
         LanguageModelingTask, but new tasks may have to override this method.
         """
+        hyp_detok = hypothesis['detok']
+        if escape:
+            hyp_detok = json.dumps(hyp_detok)
+        
         if verbose:
             s = []
 
             line_id = hypothesis.get('idx', 0)
+            prompt_tok = hypothesis.get('prompt_tokens')
             src_tok = hypothesis.get('src_tokens')  # absent with decoder-only models
-            hyp_tok = hypothesis['tokens']
-            hyp_detok = hypothesis['detok']
+            hyp_tok = ' '.join(hypothesis['tokens'])
             global_score = hypothesis['score']
             pos_scores = hypothesis.get('pos_scores')
             cross_attn = [
                 v.mean(axis=1) for k, v in hypothesis.items() if k.startswith('dec_') and k.endswith('_cross_attn')
             ]
-            
-            if isinstance(src_tok, str):  # not str in SpeechTranslationTask
+
+            if isinstance(src_tok, list):
+                src_tok = ' '.join(src_tok)
                 s.append(f'S-{line_id}\t{src_tok}')
                 
                 if cross_attn:
@@ -699,6 +720,9 @@ class Task:
                     alignment = ' '.join(map(str, alignment))
                     s.append(f'A-{line_id}\t{alignment}')
 
+            if isinstance(prompt_tok, list):
+                prompt_tok = ' '.join(prompt_tok)
+                s.append(f'I-{line_id}\t{prompt_tok}')
             s.append(f'H-{line_id}\t{hyp_tok}')
             s.append(f'D-{line_id}\t{hyp_detok}')
             if pos_scores is not None:
@@ -706,11 +730,12 @@ class Task:
 
             return '\n'.join(s)
         else:
-            return hypothesis['detok']
+            return hyp_detok
 
     def load_checkpoint_for_inference(
         self,
-        *ckpt_paths: str,
+        main_ckpt_path: str,
+        *other_ckpt_paths: str,
         rank: int = 0,
         world_size: int = 1,
         arch: Optional[str] = None,
@@ -718,14 +743,16 @@ class Task:
         """
         Used at inference by `decoding.TextGenerator` to load a model's checkpoint and hyper-parameters; and optionally
         parallelize it with given settings.
-        One key different to training is that the model hyper-parameters are not specified, but loaded from the model's
+        One key difference to training is that the model hyper-parameters are not specified, but loaded from the model's
         checkpoint. So we do not know the model architecture in advance (unless it explicitely specified with `arch`)
 
         For now, this does not support checkpoint resharding: i.e., if the model is sharded, the checkpoint has to 
         be sharded too and have the same number of shards (and conversely)
 
         Args:
-            - ckpt_paths: checkpoints to load
+            - main_ckpt_path: checkpoint to load
+            - other_ckpt_paths: other optional checkpoints to merge into the main checkpoint (e.g., base model
+                parameters for a fine-tuned checkpoint containing only adapters)
             - rank: distributed rank. If the model is sharded, this corresponds to the model shard id
             - world_size: distributed world size (i.e., number of GPUs). If the model is sharded this corresponds to 
                 number of model shards
@@ -734,8 +761,6 @@ class Task:
             tuple (checkpoint, model_cfg) where checkpoint is a dict containing all the model weights for this rank,
                 and model_cfg a model configuration containing the hyper-parameters
         """
-        assert len(ckpt_paths) >= 1
-        main_ckpt_path, *other_ckpt_paths = ckpt_paths
         # This is also different from the type of sharding implemented in NLLBTranslationTask, which requires one 
         # checkpoint per expert (for loading the NLLB-200 MoE model)
         shard_paths = utils.find_checkpoint_shards(main_ckpt_path)
@@ -767,7 +792,7 @@ class Task:
 
         arch = arch or model_args.get('arch')
         assert arch is not None, 'could not find model architecture in checkpoint, use --arch'
-        model_cfg = get_model_config(arch)
+        model_cfg = get_model_config_cls(arch)()
         model_cfg.parse_dict(model_args)
         model_state = checkpoint['model']
         return model_state, model_cfg

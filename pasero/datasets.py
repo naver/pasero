@@ -21,18 +21,11 @@ from typing import Iterator, NoReturn, Optional
 from pasero import utils
 from pasero.utils import defined
 from pasero.tasks import Task, Corpus
-from pasero.config import DistributedConfig, TrainingDatasetConfig
-from pasero.config import DynamicTrainingDatasetConfig, SimpleDynamicTrainingDatasetConfig
+from pasero.config import register_dataset, DistributedConfig, TrainingDatasetConfig
+from pasero.config import DynamicTrainingDatasetConfig, SimpleDynamicTrainingDatasetConfig, DebugTrainingDatasetConfig
 
 
 logger = logging.getLogger('data')
-
-
-def get_dataset_class(cfg: TrainingDatasetConfig) -> type['TrainingDataset']:
-    if isinstance(cfg, SimpleDynamicTrainingDatasetConfig):
-        return SimpleDynamicTrainingDataset
-    else:
-        return DynamicTrainingDataset
 
 
 def dummy_batch(batch: dict, size: int = 1) -> dict:
@@ -349,7 +342,7 @@ class LineSampler(CorpusSampler):
     How to use:
         ```
         sampler = LineSampler(corpora)
-        for sample, corpus_id in sampler:   # infinite iterator
+        for sample in sampler:   # infinite iterator
             # do stuff
         ```
     """
@@ -544,21 +537,22 @@ class ValidationDataset:
         self.shard_id = dist_cfg.dp_rank or 0
         self.max_lines = max_lines
         self.task = task
-        self.collate_fn = task.get_collate_fn(dist_cfg.dtype)
+        self.collate_fn = task.get_collate_fn(getattr(torch, dist_cfg.dtype))
         self.truncate = truncate
+        self.task.eval()  # preprocessing and batching can be different between training and validation data
         self.data, self.references = self.read(line_index, verbose=verbose)
         self.length = len(self.data)
 
         # build batches (this can be done once and for all, because we don't need to shuffle)
-        batch_indices = self.task.build_batches(
+        batches = self.task.build_batches(
             self.data,
             shuffle=False,
         )
-        shard_len = math.ceil(len(batch_indices) / self.shard_count)
-        batch_indices = batch_indices[self.shard_id::self.shard_count]
-        batch_indices += [[]] * (shard_len - len(batch_indices))  # pad with empty batches to ensure all GPUs get the
+        shard_len = math.ceil(len(batches) / self.shard_count)
+        batches = batches[self.shard_id::self.shard_count]
+        batches += [[]] * (shard_len - len(batches))  # pad with empty batches to ensure all GPUs get the
         # same number of batches (those empty batches will be converted to None by the collater)
-        self.batch_indices = batch_indices
+        self.batches = batches
 
         oov_tokens = total_tokens = 0
         for sample_bin in self.data:
@@ -568,7 +562,7 @@ class ValidationDataset:
         oov_percentage = oov / max(1, total)
 
         logger.info(
-            f'{self.corpus} | {len(self.data)} lines | {len(self.batch_indices)} batches | '
+            f'{self.corpus} | {len(self.data)} lines | {len(self.batches)} batches | '
             f'oov tokens {oov_percentage:.2%}'
         )
     
@@ -585,7 +579,6 @@ class ValidationDataset:
             max_lines=self.max_lines,
         )
 
-        self.task.eval()  # preprocessing can be different between training and validation data
         for sample in reader:
             reference = self.task.get_reference(sample)
             if reference is not None:
@@ -594,6 +587,7 @@ class ValidationDataset:
             sample_bin = self.task.preprocess(
                 sample,
                 truncate=self.truncate,
+                append_eos=True,
             )
             
             if not sample_bin:  # too long or too short
@@ -609,12 +603,8 @@ class ValidationDataset:
         return data, references
 
     def __iter__(self) -> Iterator[dict]:
-        for indices in self.batch_indices:
-            data = [self.data[idx] for idx in indices]
-            batch = self.collate_fn(data)
-            if batch is not None:
-                batch['indices'] = indices  # used for reordering
-            yield batch
+        for batch in self.batches:
+            yield self.collate_fn(batch)
 
 
 class TrainingDataset(torch.utils.data.IterableDataset):
@@ -634,7 +624,7 @@ class TrainingDataset(torch.utils.data.IterableDataset):
     ):
         self.cfg = cfg
         self.task = task
-        self.collate_fn = task.get_collate_fn(dist_cfg.dtype)
+        self.collate_fn = task.get_collate_fn(getattr(torch, dist_cfg.dtype))
         self.corpora = corpora
         self.shuffle = cfg.shuffle
         self.seed = dist_cfg.seed or 42
@@ -656,6 +646,11 @@ class TrainingDataset(torch.utils.data.IterableDataset):
         self.truncate = cfg.truncate
         self.store_files_under = cfg.store_files_under
         self.close_files = cfg.close_files
+        self.batch_size = task.cfg.batch_size
+        if dist_cfg.sequence_parallel and dist_cfg.tp_size > 1:  # simulates data parallelism by increasing the batch 
+            # size (because sequence parallelism needs to shard the batch into `tp_size` batches). This is not done
+            # in `ValidationDataset` because `sequence_parallelism` is disabled at validation.
+            self.batch_size *= dist_cfg.tp_size
 
     def init_logger(self):
         """
@@ -711,30 +706,31 @@ class TrainingDataset(torch.utils.data.IterableDataset):
         yield from data_loader
 
     def buffered_batching(self, buffer: list[dict]) -> list[list[dict]]:
-        if self.batch_by:   # build homogeneous batches w.r.t. source lang, target lang and/or domain
-            groups = collections.defaultdict(list)
-            for sample in buffer:
-                key = tuple(sample['meta'].get(k) for k in self.batch_by)
-                groups[key].append(sample)
-            groups = groups.values()
-        else:
-            groups = [buffer]
+        # build homogeneous batches w.r.t. source lang, target lang and/or domain
+        groups = collections.defaultdict(list)
+        for sample in buffer:
+            key = tuple(sample['meta'].get(k) for k in self.batch_by)
+            if sample.get('encoder_input') is not None:
+                # for multimodal inputs (we don't want audio and text in the same batch)
+                ndim = sample['encoder_input'].ndim
+                dtype = sample['encoder_input'].dtype
+                key = key + (ndim, dtype)
+            groups[key].append(sample)
+        groups = groups.values()
 
         batches = []
         for group in groups:
-            batch_indices = self.task.build_batches(
+            batches += self.task.build_batches(
                 group,
                 shuffle=self.shuffle,
+                batch_size=self.batch_size,  # override `task_cfg.batch_size`
             )
-            for indices in batch_indices:
-                batch = [group[idx] for idx in indices]
-                batches.append(batch)
-        
         if self.shuffle:
             np.random.shuffle(batches)
         return batches
 
 
+@register_dataset('dynamic')
 class DynamicTrainingDataset(TrainingDataset):
     """
     Multilingual training dataset whose data is loaded and pre-processed on the fly.
@@ -757,6 +753,8 @@ class DynamicTrainingDataset(TrainingDataset):
     However, each GPU has its own DataLoader, which can also spawn processes depending on the --dataloader-workers 
     value.
     """
+    cfg: DynamicTrainingDatasetConfig
+
     def __init__(
         self,
         cfg: DynamicTrainingDatasetConfig,
@@ -911,6 +909,7 @@ class DynamicTrainingDataset(TrainingDataset):
                 sample_bin = self.task.preprocess(
                     sample,
                     truncate=self.truncate,
+                    append_eos=True,
                 )
 
                 total_lines += 1
@@ -942,6 +941,7 @@ class DynamicTrainingDataset(TrainingDataset):
         self.init_logger()
         np.random.seed(self.seed)
         logger.info(f'started batcher')
+        self.task.train()
         try:
             worker_id = 0
             gpu_id = 0
@@ -972,6 +972,7 @@ class DynamicTrainingDataset(TrainingDataset):
                 break
 
 
+@register_dataset('simple')
 class SimpleDynamicTrainingDataset(TrainingDataset):
     """
     Similar to DynamicTrainingDataset, but does not use any queue or processes other than those created by 
@@ -991,6 +992,8 @@ class SimpleDynamicTrainingDataset(TrainingDataset):
     Note that if memory is not an issue but disk I/Os are a bottleneck, `--cache-data` can be used to store all 
     examples and avoid having to read and preprocess them again at the next epoch.
     """
+    cfg: SimpleDynamicTrainingDatasetConfig
+
     def __init__(
         self,
         cfg: SimpleDynamicTrainingDatasetConfig,
@@ -1098,6 +1101,7 @@ class SimpleDynamicTrainingDataset(TrainingDataset):
                     sample_bin = self.task.preprocess(
                         sample,
                         truncate=self.truncate,
+                        append_eos=True,
                     )
 
                     total_lines += 1
@@ -1136,3 +1140,8 @@ class SimpleDynamicTrainingDataset(TrainingDataset):
             if len(buffer) == self.buffer_size:
                 yield from self.buffered_batching(buffer)
                 buffer = []
+
+
+@register_dataset('debug')
+class DebugTrainingDataset(SimpleDynamicTrainingDataset):
+    cfg: DebugTrainingDatasetConfig

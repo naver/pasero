@@ -116,15 +116,15 @@ class Trainer:
         
         self.fsdp = cfg.fsdp and cfg.dp_size > 1
 
-        if cfg.virtual_dp_size % cfg.dp_size != 0:
+        dp_size = cfg.dp_size if cfg.tp_size == 1 else cfg.tp_size if cfg.sequence_parallel else 1  # tensor 
+        # parallelism with --sequence-parallel simulates data parallelism by multiplying the batch size by --tp-size
+        # (in `TrainingDataset`)
+        if cfg.virtual_dp_size % dp_size != 0:
             logger.warning(
                 'for better reproducibility (constant batch sizes across runs) --virtual-dp-size should be a multiple '
-                'of --dp-size')
-        self.update_freq = max(1, cfg.virtual_dp_size // cfg.dp_size)   # normalize by the number of GPUs
-        # to have a constant batch size
-
-        if self.amp:
-            assert hasattr(torch, 'autocast'), 'automatic mixed precision is not supported by this torch version'
+                'of --dp-size and --tp-size')
+        self.update_freq = max(1, cfg.virtual_dp_size // dp_size)  # normalize by the number of GPUs to have a 
+        # constant total batch size (regardless of --dp-size or --tp-size)
 
         self.model = model
         self.param_names = []
@@ -233,7 +233,11 @@ class Trainer:
 
             self.model = self.ddp_model.module
         else:
-            find_unused_parameters = cfg.find_unused_parameters or self.model.find_unused_parameters
+            find_unused_parameters = (
+                cfg.find_unused_parameters or
+                self.model.find_unused_parameters or
+                self.task.find_unused_parameters
+            )
             assert not find_unused_parameters or not self.cfg.model_cfg.checkpoint_activations, ('DDP does not support '
                 'checkpointed models with unused parameters')
             self.ddp_model = DDP(
@@ -288,18 +292,24 @@ class Trainer:
             enabled=self.dtype is torch.float16,
         )
 
-        opts = dict(lr=self.cfg.lr, betas=self.cfg.adam_betas, weight_decay=self.cfg.weight_decay)
-        if self.dtype != torch.float16 or self.sharded or self.cfg.memory_efficient_fp16:
+        opts = dict(
+            lr=self.cfg.lr,
+            betas=self.cfg.adam_betas,
+            weight_decay=self.cfg.weight_decay,
+            optimizer_states_as_fp32=self.cfg.optimizer_states_as_fp32,
+        )
+        
+        if self.dtype == torch.float32 or self.sharded or self.cfg.memory_efficient_fp16:
             # Version of Adam which converts on the fly float16 grads and params to float32 before updating statistics
-            # This is slower than FP16Adam, but it uses less memory as no float32 copy of the parameters and gradients
-            # needs to be maintained
+            # This is slower than MixedPrecisionAdam, but it uses less memory as no float32 copy of the parameters and 
+            # gradients needs to be maintained
             self.optimizer = optimization.Adam(self.trainable_params, **opts)
         elif self.cfg.flat_fp16:  # note that this does not work with sharded parameters (e.g., tp_size > 1)
             # All parameters and gradients are flattened into single tensors. This is faster but takes more memory
             self.optimizer = optimization.FlatFP16Adam(self.trainable_params, **opts)
         else:
             # Like Adam, but keeps a float32 copy of the parameters and gradients
-            self.optimizer = optimization.FP16Adam(self.trainable_params, **opts)
+            self.optimizer = optimization.MixedPrecisionAdam(self.trainable_params, **opts)
 
         self.scheduler = optimization.LRScheduler(self.cfg, self.optimizer)
     
@@ -334,7 +344,7 @@ class Trainer:
                         except:
                             traceback.print_exc()
                     if self.cfg.sequence_parallel and batch is not None:
-                        batch_size = batch['target'].size(0)
+                        batch_size = batch['decoder_input'].size(0)
                         if batch_size % self.cfg.tp_size != 0:  # skip batches that cannot be sharded
                             continue
                         batch = datasets.shard_batch(
@@ -703,7 +713,7 @@ class Trainer:
         model_dir = self.cfg.model_dir
 
         def has_symlink(filename):
-            # Check whether there exists a symlink leading to this file or to the main shard
+            # Check whether there exists a symlink leading to the main shard of this checkpoint (e.g., 'model_best.bin')
             filename = regex.sub(r'_\d{3}_of_(\d{3}).bin$', r'_001_of_\1.bin', filename)
             # model/model_1000_003_of_004.bin -> model/model_1000_001_of_004.bin
             # model/model_1000.bin -> model/model_1000.bin
@@ -821,7 +831,7 @@ class Trainer:
 
         if load_train_state:
             self.optimizer = None
-            self.build_optimizer()   # it is important for FP16Adam that the optimizer is built after
+            self.build_optimizer()   # it is important for MixedPrecisionAdam that the optimizer is built after
             # loading the model state dict 
             self.steps = state_dict.get('steps')
             optim_state = state_dict.get('optimizer')

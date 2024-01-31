@@ -16,7 +16,7 @@ examples/ParaCrawl-Euro/download.sh
 
 ### Optionally create a Pasero BPE model and dictionary
 
-These are already available in [examples/ParaCrawl-Euro](examples/ParaCrawl-Euro)
+These are already available in [examples/ParaCrawl-Euro](/examples/ParaCrawl-Euro)
 
 ```bash
 pasero-build-tokenizer -i data/ParaCrawl-Euro/multiparallel/ParaCrawl.{en,fr,de,es,it,pt,nl,nb,cs,pl,sv,da,el,fi,hr,hu,bg,ro,sk,lt,lv,sl,et,ga,is,mt} \
@@ -33,5 +33,5 @@ pasero-train -c examples/ParaCrawl-Euro/training-en-centric.yaml --dp-size 4 -o 
 ### Finetune the English-centric model with multi-parallel data
 
 ```bash
-pasero-train -c examples/ParaCrawl-Euro/training.yaml --dp-size 4 --ckpt models/ParaCrawl-Euro/wide.12-2.en-centric/model_last.bin -o models/ParaCrawl-Euro/wide.12-2.multi-parallel
+pasero-train -c examples/ParaCrawl-Euro/training.yaml --dp-size 4 --ckpt models/ParaCrawl-Euro/wide.12-2.en-centric/model_last.bin -o models/ParaCrawl-Euro/wide.12-2.multi-parallel --lr 0.0003
 ```

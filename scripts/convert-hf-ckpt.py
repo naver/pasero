@@ -2,6 +2,7 @@
 # Pasero Copyright (c) 2023-present NAVER Corporation
 # Please refer to the license file provided in the project.
 
+import os
 import torch
 import argparse
 import regex
@@ -68,6 +69,30 @@ llama_mapping = {
     'model.layers.0.mlp.up_proj.weight': ['decoder.layers.0.fc3.weight'],
 }
 
+mixtral_mapping = {
+    **llama_mapping,
+    'model.layers.0.block_sparse_moe.gate.weight': ['decoder.layers.0.moe_layer.gate.weight'],
+    'model.layers.0.block_sparse_moe.experts.0.w1.weight': ['decoder.layers.0.moe_layer.experts.0.fc1.weight'],
+    'model.layers.0.block_sparse_moe.experts.0.w2.weight': ['decoder.layers.0.moe_layer.experts.0.fc2.weight'],
+    'model.layers.0.block_sparse_moe.experts.0.w3.weight': ['decoder.layers.0.moe_layer.experts.0.fc3.weight'],
+}
+
+mixtral_official_mapping = {
+    'tok_embeddings.weight': ['decoder.embed_tokens.weight'],
+    'norm.weight': ['decoder.layer_norm.weight'],
+    'output.weight': ['decoder.output_projection.weight'],
+    'layers.0.attention_norm.weight': ['decoder.layers.0.self_attn_layer_norm.weight'],
+    'layers.0.ffn_norm.weight': ['decoder.layers.0.final_layer_norm.weight'],
+    'layers.0.attention.wq.weight': ['decoder.layers.0.self_attn.q_proj.weight'],
+    'layers.0.attention.wk.weight': ['decoder.layers.0.self_attn.k_proj.weight'],
+    'layers.0.attention.wv.weight': ['decoder.layers.0.self_attn.v_proj.weight'],
+    'layers.0.attention.wo.weight': ['decoder.layers.0.self_attn.out_proj.weight'],
+    'layers.0.feed_forward.gate.weight': ['decoder.layers.0.moe_layer.gate.weight'],
+    'layers.0.feed_forward.experts.0.w1.weight': ['decoder.layers.0.moe_layer.experts.0.fc1.weight'],
+    'layers.0.feed_forward.experts.0.w2.weight': ['decoder.layers.0.moe_layer.experts.0.fc2.weight'],
+    'layers.0.feed_forward.experts.0.w3.weight': ['decoder.layers.0.moe_layer.experts.0.fc3.weight'],
+}
+
 mpt_mapping = {
     'transformer.wte.weight': ['decoder.embed_tokens.weight'],
     'transformer.blocks.0.ffn.up_proj.weight': ['decoder.layers.0.fc1.weight'],
@@ -120,9 +145,9 @@ falcon_40b_mapping = {
 }
 
 t5_mapping = {
-    'encoder.embed_tokens.weight': ['encoder.embed_tokens.weight'],
+    'encoder.embed_tokens.weight': [],
     'decoder.embed_tokens.weight': [],
-    'shared.weight': [],
+    'shared.weight': ['encoder.embed_tokens.weight'],
     'lm_head.weight': ['decoder.output_projection.weight'],
     'encoder.final_layer_norm.weight': ['encoder.layer_norm.weight'],
     'decoder.final_layer_norm.weight': ['decoder.layer_norm.weight'],
@@ -159,17 +184,19 @@ mappings = {
     'llama_official': llama_official_mapping,
     'llama': llama_mapping,
     'mistral': llama_mapping,
+    'mixtral': mixtral_mapping,
+    'mixtral_official': mixtral_official_mapping,
     'mpt': mpt_mapping,
     'falcon_7b': falcon_7b_mapping,
     'falcon_40b': falcon_40b_mapping,
     't5': t5_mapping,
+    'whisper': None,
 }
 
 
 description = """
-Helper script to convert HuggingFace checkpoints into the Pasero format. A Pasero-style dictionary will also have to 
-be extracted using `scripts/hf-tokenizer-to-dict.py`. The original llama checkpoints (different from the HuggingFace 
-ones) are also supported with `--arch llama_official`.
+Helper script to convert HuggingFace checkpoints into the Pasero format. The original llama checkpoints 
+(different from the HuggingFace ones) are also supported with `--arch llama_official`.
 
 The right hyper-parameters will have to be provided by command-line when decoding with `pasero-decode` (--tokenizer, 
 --tokenizer-path, --task, --arch), or existing 'inference.yaml' (available in the respective "examples/" folders) can be 
@@ -187,13 +214,25 @@ parser.add_argument('input_ckpt', nargs='+', help='paths to the HuggingFace chec
 parser.add_argument('-o', '--output-ckpt', required=True, help='output path for the new Pasero-style checkpoint')
 parser.add_argument('--heads', type=int, help="number of attention heads in this model "
                     "(required by the 'bloom' and 'llama_official' architectures)")
-parser.add_argument('--arch', choices=list(mappings), required=True, help='which architecture this model belongs to')
+parser.add_argument('--kv-heads', type=int, help='number of heads for the keys and values (if different that --heads)')
+parser.add_argument('--arch', default='llama', choices=list(mappings), required=True,
+                    help='which architecture this model belongs to')
 parser.add_argument('--dtype', default='float16', choices=['float16', 'bfloat16', 'float32'],
                     help='the data type of the output checkpoint: float16 and bfloat16 are twice as compact as float32')
 args = parser.parse_args()
 
-if args.arch in ('llama_official', 'bloom'):
+if args.arch == 'mixtral_official':
+    args.heads = args.heads or 32
+    args.kv_heads = args.kv_heads or 8
+
+args.kv_heads = args.kv_heads or args.heads
+
+if args.arch in ('llama_official', 'bloom', 'mixtral_official'):
     assert args.heads
+
+dirname = os.path.dirname(args.output_ckpt)
+if dirname:
+    os.makedirs(dirname, exist_ok=True)
 
 dtype = getattr(torch, args.dtype)
 
@@ -204,7 +243,12 @@ decoder_layers = 0
 
 for path in args.input_ckpt:
     print(f"loading '{path}")
-    ckpt = torch.load(path, map_location='cpu')
+
+    if path.endswith('.safetensors'):
+        import safetensors.torch
+        ckpt = safetensors.torch.load_file(path)
+    else:
+        ckpt = torch.load(path, map_location='cpu')
 
     if args.arch == 'whisper':
         # special case for whisper, whose parameter names almost exactly match ours
@@ -220,7 +264,12 @@ for path in args.input_ckpt:
         continue
     
     patterns = [
-        (regex.escape(k).replace(r'\.0\.', r'\.(?P<layer_id>\d+)\.', 1), v)
+        (
+            regex.escape(k)
+                .replace(r'experts\.0\.', r'experts\.(?P<expert_id>\d+)\.', 1)
+                .replace(r'\.0\.', r'\.(?P<layer_id>\d+)\.', 1),
+            v
+        )
         for k, v in mappings[args.arch].items()
     ]
 
@@ -233,6 +282,8 @@ for path in args.input_ckpt:
             if (m := regex.fullmatch(pattern, name)):
                 layer_id = m.groupdict().get('layer_id')
                 layer_id = -1 if layer_id is None else int(layer_id)
+                expert_id = m.groupdict().get('expert_id')
+                expert_id = -1 if expert_id is None else int(expert_id)
 
                 if len(new_names) == 0:
                     print(f'{name} ->')
@@ -243,13 +294,19 @@ for path in args.input_ckpt:
 
                 for i, new_name in enumerate(new_names):
                     
-                    new_name = new_name.replace('.0.', f'.{layer_id}.', 1)
+                    new_name = (
+                        new_name
+                            .replace('experts.0.', f'experts.{expert_id}.', 1)
+                            .replace('.0.', f'.{layer_id}.', 1)
+                    )
+
                     new_dim = shape[0] // len(new_names)
 
                     if len(new_names) == 1:
                         value_ = value
-                        if args.arch == 'llama_official' and (name.endswith('.wq.weight') or name.endswith('.wk.weight')):
-                            value_ = value_.reshape(args.heads//len(args.input_ckpt), -1, 2, shape[-1])
+                        if args.arch in ('llama_official', 'mixtral_official') and (name.endswith('.wq.weight') or name.endswith('.wk.weight')):
+                            heads = args.heads if name.endswith('.wq.weight') else args.kv_heads
+                            value_ = value_.reshape(heads//len(args.input_ckpt), -1, 2, shape[-1])
                             value_ = value_.transpose(1, 2).reshape(-1, shape[-1])
                     # fused qkv attention layers
                     elif args.arch == 'bloom':  # reshape the attention matrix to avoid having to implement a specific

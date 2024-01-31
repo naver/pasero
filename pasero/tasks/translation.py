@@ -10,8 +10,8 @@ import regex
 from typing import Optional, Any
 from torch import Tensor
 from pasero import utils
-from pasero.utils import defined, tokens_as_tensor, SpecialTokens, warn_once
-from pasero.config import TranslationTaskConfig, PreprocessingConfig, NoiseConfig, TransformerConfig
+from pasero.utils import defined, tokens_as_tensor
+from pasero.config import register_task, TranslationTaskConfig, PreprocessingConfig, NoiseConfig, TransformerConfig
 from pasero.preprocessing import Dictionary, TextPreprocessor, copy_tag, get_domain_tag, get_lang_code, split_tags
 from pasero.tasks import Task, Corpus, InferenceCorpus
 
@@ -112,6 +112,7 @@ class InferenceParallelCorpus(InferenceCorpus, ParallelCorpus):
     def ref_path(self) -> str: return self.target_path
 
 
+@register_task('translation')
 class TranslationTask(Task):
     cfg: TranslationTaskConfig
 
@@ -134,11 +135,6 @@ class TranslationTask(Task):
             setattr(tgt_preprocessor_cfg, key, value)
         self.tgt_preprocessor = TextPreprocessor(tgt_preprocessor_cfg, data_dir)
 
-        # check that all tokenizers share the same special tokens
-        assert self.src_preprocessor.special_tokens == self.tgt_preprocessor.special_tokens, (
-            'source and target preprocessors should have the same special tokens'
-        )
-        
         if cfg.freeze_source_embed_regex:
             # used in Transformer to find which source embeddings to freeze: any source token that matches this regex
             # will have its source embedding frozen
@@ -225,16 +221,10 @@ class TranslationTask(Task):
         if meta.get('domain') is not None:
             assert meta['domain'] in self.domains, 'this domain is not covered by the model'
 
-    def set_model_type(self, model_type: str) -> None:
-        if model_type == 'decoder':
+    def setup_for_model(self, model_cfg: TransformerConfig) -> None:
+        if model_cfg.model_type == 'decoder':
             assert self.max_target_len > self.max_source_len
-            if not self.cfg.target_tags and not self.cfg.target_lang_code:
-                warn_once(
-                    logger,
-                    'attempting decoder-only MT without a separator between source and target (it is recommended '
-                    'to set --target-tags SOME_SPECIAL_TOKENS or --target-lang-code)'
-                )
-        super().set_model_type(model_type)
+        super().setup_for_model(model_cfg)
 
     @property
     def task_info(self) -> dict:
@@ -287,27 +277,42 @@ class TranslationTask(Task):
         return {'source': source, 'target': target, 'meta': meta}
 
     @property
-    def encoder_num_embeddings(self):
+    def encoder_num_embeddings(self) -> int:
         return 0 if self.model_type == 'decoder' else self.src_preprocessor.num_symbols
 
     @property
-    def decoder_num_embeddings(self):
+    def decoder_num_embeddings(self) -> int:
         return self.tgt_preprocessor.num_symbols
 
     @property
-    def preprocessors(self):
+    def preprocessor(self) -> TextPreprocessor:
+        return self.tgt_preprocessor
+
+    @property
+    def preprocessors(self) -> dict[str, TextPreprocessor]:
         return {'source': self.src_preprocessor, 'target': self.tgt_preprocessor}
 
     def log_sample(self, sample_bin: dict) -> None:
         corpus_id = sample_bin['meta']['corpus_id']
 
-        if 'source' in sample_bin:
+        if 'encoder_input' in sample_bin:
             # decoder-only models don't have sources (source and target are concatenated)
-            source_tok = self.src_preprocessor.debinarize(sample_bin['source'])
-            logger.debug(f'{corpus_id} | source line example: {source_tok}')
+            encoder_input = self.src_preprocessor.debinarize(sample_bin['encoder_input'])
+            encoder_input = ' '.join(encoder_input)
+            logger.debug(f'{corpus_id} | source line example: {encoder_input}')
 
-        target_tok = self.tgt_preprocessor.debinarize(sample_bin['target'])
-        logger.debug(f'{corpus_id} | target line example: {target_tok}')
+        decoder_input = self.tgt_preprocessor.debinarize(sample_bin['decoder_input'])
+        # color in green the target words that are part of the prompt (optionally excluded from the training loss,
+        # and teacher forced at inference)
+        prompt_mask = sample_bin['prompt_mask']
+        make_green = lambda s: "\x1b[32;20m" + s + "\x1b[0m"
+        decoder_input = [
+            make_green(token) if is_prompt else token
+            for token, is_prompt in zip(decoder_input, prompt_mask)
+        ]
+        decoder_input = ' '.join(decoder_input)
+        corpus_id = sample_bin['meta']['corpus_id']
+        logger.debug(f'{corpus_id} | target line example: {decoder_input}')
 
     def get_reference(self, sample: dict[str, Any]):
         return sample['target']
@@ -322,7 +327,7 @@ class TranslationTask(Task):
             self.max_len_ratio and ratio > self.max_len_ratio
         )
 
-    def copy_placeholder(self, source_tok: str, target_tok: str) -> tuple[str, str]:
+    def copy_placeholder(self, source_tok: list[str], target_tok: list[str]) -> tuple[str, str]:
         # Replace OOV symbols with the same source and target count (typically emojis) with a copy
         # placeholder.
         # OOV characters whose count doesn't match are just removed.
@@ -331,8 +336,8 @@ class TranslationTask(Task):
         to_copy = {w for w in src_oov | tgt_oov if src_counts[w] == tgt_counts[w]}
         to_del = {w for w in src_oov | tgt_oov if len(w) == 1 and src_counts[w] != tgt_counts[w]}
         if to_copy or to_del:
-            source_tok = ' '.join(copy_tag if w in to_copy else w for w in source_tok.split() if w not in to_del)
-            target_tok = ' '.join(copy_tag if w in to_copy else w for w in target_tok.split() if w not in to_del)
+            source_tok = [copy_tag if w in to_copy else w for w in source_tok if w not in to_del]
+            target_tok = [copy_tag if w in to_copy else w for w in target_tok if w not in to_del]
         return source_tok, target_tok
 
     def check_tags(self):
@@ -402,7 +407,7 @@ class TranslationTask(Task):
         sample: dict[str, Any],
         truncate: bool = False,
         tokenize: bool = True,
-        inference: bool = False,
+        append_eos: bool = False,
     ) -> dict[str, Any]:
         """
         Pre-process given sample pair with this task's preprocessors. The inputs are un-tokenized text and the outputs
@@ -414,12 +419,13 @@ class TranslationTask(Task):
                 source lang, target lang and domain
             truncate: whether to truncate sources and targets that are too long
             tokenize: whether the sample should be tokenized (set to False if it is already tokenized)
-            inference: True when this method is called with inference inputs (by TextGenerator)
+            append_eos: whether to add end of sequence tokens to the decoder input (e.g., at training or for teacher
+                forcing at inference)
 
-        Returns: a dict with keys 'source', 'target', 'prompt_mask' and 'emojis'
-            source: tokenized and binarized source sentence (as a numpy array)
-            target: tokenized and binarized target sentence (as a numpy array)
-            prompt_mask: boolean mask identifying which parts of `target` are not being predicted (their training 
+        Returns: a dict with keys 'encoder_input', 'decoder_input', 'prompt_mask' and 'emojis'
+            encoder_input: tokenized and binarized source sentence (as a numpy array)
+            decoder_input: tokenized and binarized target sentence (as a numpy array)
+            prompt_mask: boolean mask identifying which parts of `decoder_input` are not being predicted (their training 
                 loss may be disabled with --prompt-loss 0)
             emojis: list of emojis found in the source string and replaced with placeholders
         """
@@ -451,60 +457,77 @@ class TranslationTask(Task):
         else:
             emojis = []
         
-        source_tok = self.src_preprocessor.tokenize(source) if tokenize else source
-        source_tok = ' '.join(src_tags + [source_tok])
+        source_tok = src_tags + self.src_preprocessor.tokenize(source) if tokenize else source.split()
 
         target_tok = list(tgt_tags)
         if not target:
             pass
         elif tokenize:
-            target_tok.append(self.tgt_preprocessor.tokenize(target))
+            target_tok += self.tgt_preprocessor.tokenize(target)
         else:
-            target_tok.append(target)
-        target_tok = ' '.join(target_tok)
+            target_tok += target.split()
 
         if self.cfg.copy_placeholder and self.training:
             source_tok, target_tok = self.copy_placeholder(source_tok, target_tok)
 
         if self.model_type == 'decoder':  # concatenate
             
-            source_bin = self.src_preprocessor.binarize(source_tok, max_len=source_cutoff, append_eos=False)
+            source_bin = self.src_preprocessor.binarize(
+                source_tok,
+                max_len=source_cutoff,
+                prepend_bos=self.prepend_bos,
+                append_eos=True,  # use EOS as a separator between source and target
+            )
             if target_cutoff is not None:
                 target_cutoff -= len(source_bin)
             
             target_bin = self.tgt_preprocessor.binarize(
                 target_tok,
                 max_len=target_cutoff,
+                prepend_bos=False,
+                append_eos=append_eos,
             )
             
             source_mask = np.ones_like(source_bin, dtype=bool)
             target_mask = np.zeros_like(target_bin, dtype=bool)
             target_mask[:prompt_len] = True  # mask lang codes, etc.
+            decoder_input = np.concatenate([source_bin, target_bin])
+            prompt_mask = np.concatenate([source_mask, target_mask])
             
-            if self.should_skip(len(source_bin), len(source_bin) + len(target_bin)):  # max target length applies to the
-                # concatenation
-                assert not truncate  # this shouldn't happen since we truncate
-                return {}
-            else:                
-                return {
-                    'target': np.concatenate([source_bin, target_bin]),
-                    'prompt_mask': np.concatenate([source_mask, target_mask]),
-                    'emojis': emojis,
-                    'meta': meta,
-                }
-        else:
-            source_bin = self.src_preprocessor.binarize(source_tok, max_len=source_cutoff)
-            target_bin = self.tgt_preprocessor.binarize(target_tok, max_len=target_cutoff)
-            
-            prompt_mask = np.zeros_like(target_bin, dtype=bool)
-            prompt_mask[:prompt_len] = True
-            if self.should_skip(len(source_bin), len(target_bin)):
+            if self.should_skip(len(source_bin), len(decoder_input)):  # max target length applies to
+                # the concatenation
                 assert not truncate  # this shouldn't happen since we truncate
                 return {}
             else:
                 return {
-                    'source': source_bin,
-                    'target': target_bin,
+                    'decoder_input': decoder_input,
+                    'prompt_mask': prompt_mask,
+                    'emojis': emojis,
+                    'meta': meta,
+                }
+        else:
+            encoder_input = self.src_preprocessor.binarize(
+                source_tok,
+                max_len=source_cutoff,
+                prepend_bos=False,
+                append_eos=True,
+            )
+            decoder_input = self.tgt_preprocessor.binarize(
+                target_tok,
+                max_len=target_cutoff,
+                prepend_bos=self.prepend_bos,
+                append_eos=append_eos,
+            )
+            
+            prompt_mask = np.zeros_like(decoder_input, dtype=bool)
+            prompt_mask[:prompt_len + int(self.prepend_bos)] = True
+            if self.should_skip(len(encoder_input), len(decoder_input)):
+                assert not truncate  # this shouldn't happen since we truncate
+                return {}
+            else:
+                return {
+                    'encoder_input': encoder_input,
+                    'decoder_input': decoder_input,
                     'prompt_mask': prompt_mask,
                     'emojis': emojis,
                     'meta': meta,
@@ -521,9 +544,9 @@ class TranslationTask(Task):
         if self.cfg.escape_emojis:
             hypothesis['detok'] = self.tgt_preprocessor.deescape_emojis(hypothesis['detok'], sample_bin['emojis'])
         
-        if 'source' in sample_bin:
+        if 'encoder_input' in sample_bin:
             # decoder-only models don't have sources (source and target are concatenated)
-            hypothesis['src_tokens'] = self.src_preprocessor.debinarize(sample_bin['source'])
+            hypothesis['src_tokens'] = self.src_preprocessor.debinarize(sample_bin['encoder_input'])
         
     @classmethod
     def _get_corpus(cls, *args, **kwargs) -> ParallelCorpus:
@@ -854,21 +877,21 @@ class TranslationTask(Task):
     def collate(
         cls,
         batch: list[dict],
-        special_tokens: SpecialTokens,
+        padding_idx: int,
         dtype: torch.dtype,
         model_type: str,
     ) -> dict:
         if not batch:
             return None
 
-        batched = super().collate(batch, special_tokens, dtype, model_type)
+        batched = super().collate(batch, padding_idx, dtype, model_type)
 
         if model_type == 'encoder_decoder':
-            sources = [sample['source'] for sample in batch]
-            source_batch, source_length = tokens_as_tensor(sources, special_tokens, dtype=dtype)
+            encoder_input = [sample['encoder_input'] for sample in batch]
+            encoder_input, encoder_input_length = tokens_as_tensor(encoder_input, padding_idx=padding_idx, dtype=dtype)
             batched.update({
-                'source': source_batch,
-                'source_length': source_length,
+                'encoder_input': encoder_input,
+                'encoder_input_length': encoder_input_length,
             })
             if all('emojis' in sample for sample in batch):
                 batched['emojis'] = [sample['emojis'] for sample in batch]
@@ -877,16 +900,16 @@ class TranslationTask(Task):
 
     def count_oov(self, sample_bin: dict) -> tuple[int, int]:
         oov, total = super().count_oov(sample_bin)
-        if 'source' in sample_bin:
-            total += (sample_bin['source'] != self.padding_idx).sum()
+        if 'encoder_input' in sample_bin:
+            total += (sample_bin['encoder_input'] != self.padding_idx).sum()
             if self.unk_idx != self.padding_idx:
-                oov += (sample_bin['source'] == self.unk_idx).sum()
+                oov += (sample_bin['encoder_input'] == self.unk_idx).sum()
         return oov, total
 
     def remap_encoder_embed(self, embed: Optional[Tensor]) -> Optional[Tensor]:
         if self.cfg.old_source_dict and embed is not None:
             old_source_dict_path = utils.find_file(self.cfg.old_source_dict, dirs=[self.data_dir, '.'])
-            old_source_dict = Dictionary(old_source_dict_path)
+            old_source_dict = Dictionary.build(old_source_dict_path)
             embed = self.src_preprocessor.dictionary.remap_embed(
                 old_embed=embed,
                 old_dict=old_source_dict,
@@ -897,7 +920,7 @@ class TranslationTask(Task):
     def remap_decoder_embed(self, embed: Optional[Tensor]) -> Optional[Tensor]:
         if self.cfg.old_target_dict and embed is not None:
             old_target_dict_path = utils.find_file(self.cfg.old_target_dict, dirs=[self.data_dir, '.'])
-            old_target_dict = Dictionary(old_target_dict_path)
+            old_target_dict = Dictionary.build(old_target_dict_path)
             embed = self.tgt_preprocessor.dictionary.remap_embed(
                 old_embed=embed,
                 old_dict=old_target_dict,
@@ -907,7 +930,8 @@ class TranslationTask(Task):
     
     def load_checkpoint_for_inference(
         self,
-        *ckpt_paths: str,
+        main_ckpt_path: str,
+        *other_ckpt_paths: str,
         rank: int = 0,
         world_size: int = 1,
         arch: Optional[str] = None,
@@ -922,7 +946,8 @@ class TranslationTask(Task):
             self.target_langs = self.tgt_preprocessor.infer_langs()
 
         model_state, model_cfg = super().load_checkpoint_for_inference(
-            *ckpt_paths,
+            main_ckpt_path,
+            *other_ckpt_paths,
             rank=rank,
             world_size=world_size,
             arch=arch,

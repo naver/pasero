@@ -43,6 +43,8 @@ parser.add_argument('--audio-dirs', nargs='+', default=['.'], help='directories 
 parser.add_argument('--file-extension', help='append this extension to the input filenames')
 
 parser.add_argument('-i', '--input', help='read segment filenames from this input file instead of standard input')
+parser.add_argument('--txt-file', help='read lines from this text file in parallel with the audio segments and '
+                    'print the lines to standard output, empty audio segments and the corresponding lines are skipped')
 parser.add_argument('-o', '--output', required=True, help='binary file that will contain the output features')
 
 parser.add_argument('--dtype', default='float16', choices=['float16', 'float32'], help='convert the features to this '
@@ -59,6 +61,8 @@ parser.add_argument('--max-length', type=int, default=30*16000, help='maximum le
 @functools.lru_cache(3)  # saves a lot of time when multiple consecutive segments are from the same large audio file
 def load_audio(path: str, sampling_rate: int):
     waveform, sampling_rate_ = torchaudio.load(path)
+    if waveform.size(1) == 0:
+        return None
     waveform = torchaudio.functional.resample(waveform, sampling_rate_, sampling_rate)
     waveform = waveform.mean(dim=0)
     return waveform
@@ -66,6 +70,8 @@ def load_audio(path: str, sampling_rate: int):
 
 def load_and_split_audio(path: str, sampling_rate: int, start: Optional[float] = None, end: Optional[float] = None) -> Tensor:
     waveform = load_audio(path, sampling_rate)
+    if waveform is None:
+        return None
     start = None if start is None else int(start * sampling_rate)
     end = None if end is None else int(end * sampling_rate)
     return waveform[start:end]
@@ -77,7 +83,8 @@ def find_file(path: str, dirs: list[str]) -> str:
         if os.path.exists(found_path):
             return found_path
 
-    raise FileNotFoundError(f"Audio file '{path}' wasn't found anywhere")
+    # don't raise an exception, just return None. This example will be skipped
+    print(f"Audio file '{path}' wasn't found anywhere", file=sys.stderr)
 
 
 def make_batches(samples: Iterable[Tensor], batch_size: int) -> Iterator[list[Tensor]]:
@@ -153,13 +160,24 @@ if __name__ == '__main__':
             start, end = 0, None
         paths.append((path, start, end))
 
-    samples = (
-        load_and_split_audio(path, sampling_rate=args.sampling_rate, start=start, end=end)
-        for path, start, end in tqdm.tqdm(paths, total=len(paths))
-    )
+    txt_file = open(args.txt_file) if args.txt_file else None
 
-    # truncate audio samples that are too long
-    samples = (sample[:args.max_length] for sample in samples)
+    def get_samples():
+        for path, start, end in tqdm.tqdm(paths, total=len(paths)):
+            # Read text file in parallel to skip lines that correspond to audio samples that are empty
+            line = None if txt_file is None else next(txt_file)
+            if path is None:  # if file doesn't exist (skips text line)
+                continue
+            sample = load_and_split_audio(path, sampling_rate=args.sampling_rate, start=start, end=end)
+            if sample is None:  # if audio sample is empty (skips text line)
+                continue
+            # truncate audio samples that are too long
+            sample = sample[:args.max_length]
+            yield sample
+            if line is not None:
+                print(line.strip())
+
+    samples = get_samples()
 
     processor = Wav2Vec2FeatureExtractor.from_pretrained(args.huggingface_model)
     model = Wav2Vec2Model.from_pretrained(args.huggingface_model, output_hidden_states=True)

@@ -17,12 +17,10 @@ import torch.nn as nn
 from typing import Optional, Union, Any, Iterator
 from torch import Tensor, LongTensor, BoolTensor
 
-from pasero import utils, models, tasks
-from pasero.preprocessing import mask_padding
-from pasero.tasks import InferenceCorpus
-from pasero.utils import defined
+from pasero import utils, models
+from pasero.tasks import Task, InferenceCorpus
 from pasero.models import Encoder, Decoder, EncoderDecoder, Transformer, fast_init
-from pasero.config import DecodingConfig, DecodingAPIConfig
+from pasero.config import get_architecture, get_task_class, DecodingConfig, DecodingAPIConfig
 
 
 logger = logging.getLogger('decoding')
@@ -56,6 +54,9 @@ class TextGenerator:
         return cls(cfg, start=start)
 
     def sync_seed(self):
+        """
+        Called by `pasero-decode` to make sure that all GPUs have the same seed
+        """
         self.cfg.seed = utils.broadcast(self.cfg, self.cfg.seed, dtype=torch.int64)
         utils.set_random_seed(self.cfg.seed)
 
@@ -91,9 +92,13 @@ class TextGenerator:
         self.world_size = max(cfg.tp_size, cfg.dp_size)
         cfg.task_cfg.batch_size_multiple = cfg.dp_size  # to be able to shard the batches
 
-        if any(device == 'cpu' for device in self.devices):
-            assert self.dtype != torch.float16, \
-                'the float16 data type is not compatible with CPU decoding: use --dtype float32 or --dtype bfloat16'
+        for device in self.devices:
+            if device == 'cpu':
+                assert self.dtype == torch.float32, \
+                    'half-precision decoding is not supported on CPU: use --dtype float32'
+            else:
+                assert self.dtype != torch.bfloat16 or torch.cuda.get_device_capability(device)[0] >= 8, \
+                    'the bfloat16 data type is not supported by your device: use --dtype float16'
 
         at_most_one_true = lambda *conditions: sum(conditions) <= 1
         assert at_most_one_true(
@@ -106,14 +111,14 @@ class TextGenerator:
             assert dist.is_initialized(), "data and model parallelism should be used only from 'pasero-decode' " \
                 "the decoding API only supports pipeline parallelism"
 
-        if self.data_parallel or self.tensor_parallel or self.pipeline_parallel:
-            assert not cfg.encoder_decoder_swapping, 'CPU offloading is incompatible with parallelism'
+        if self.tensor_parallel or self.pipeline_parallel:
+            assert not cfg.encoder_decoder_swapping, 'CPU offloading is incompatible with model parallelism'
 
         if cfg.benchmark and utils.is_master(cfg):
             utils.benchmark.enable()
         
-        task_cls = tasks.get_task_class(cfg.task)
-        self.task = task_cls(cfg.model_dir, cfg.task_cfg)
+        task_cls = get_task_class(cfg.task)
+        self.task: Task = task_cls(cfg.model_dir, cfg.task_cfg)
 
         self.cfg = cfg
         self.metrics = utils.Metrics(history_size=-1)
@@ -150,30 +155,39 @@ class TextGenerator:
         return self.model.decoder
 
     @torch.inference_mode()
-    def load_model(self, *ckpt_paths: str) -> Transformer:
-        
+    def load_model(self, main_ckpt_path: str, *other_ckpt_paths: str) -> Transformer:
+        """
+        Load model configuration and parameters from the given checkpoint, initialize a model with use and return 
+        this model.
+        The model parameters loaded from the other given checkpoints are merged into the main checkpoint: this is 
+        useful to load trained adapters (the main checkpoint) and the base model's parameters (other checkpoint).
+        In case of sharded checkpoint (e.g., for tensor parallelism), only the first shard should be given and the other
+        shards will automatically be found.
+        """
         model_state, model_cfg = self.task.load_checkpoint_for_inference(
-            *ckpt_paths,  # these will be merged into a single model
+            main_ckpt_path,
+            *other_ckpt_paths,  # these will be merged into the main checkpoint
             rank=self.rank,
             world_size=self.world_size,
             arch=self.cfg.arch,
         )
 
+        # FIXME: these 3 things should all be done in a single call
         model_cfg.setup_for_inference(self.cfg)
         # The maximum source and target lengths are None by default and set automatically from the model's settings
         # when loading it:
         self.task.cfg.set_max_length(model_cfg)  # task.max_len / task.max_source_len / task.max_target_len are 
         # properties, so this should work
-        self.task.set_model_type(model_cfg.model_type)
-        # TODO: if model_cfg.disable_bos, set task.special_tokens.bos_idx to None
+        self.task.setup_for_model(model_cfg)
+
         logger.debug(f"model arguments: {model_cfg.as_dict()}")
 
-        arch_cls = models.get_architecture(model_cfg)
+        arch_cls = get_architecture(model_cfg)
         
         # Save time and CPU/GPU memory by directly creating parameters of the right type and on the right device
-        device = None if self.pipeline_parallel else self.devices[0]
+        device = None if self.pipeline_parallel or self.cfg.encoder_decoder_swapping else self.devices[0]
         with fast_init(device=device, dtype=self.dtype):
-             model = arch_cls(model_cfg, dist_cfg=self.cfg, task=self.task)
+             model: Transformer = arch_cls(model_cfg, dist_cfg=self.cfg, task=self.task)
 
         logger.debug(model)
         for name, param in model.named_parameters():
@@ -193,6 +207,13 @@ class TextGenerator:
 
     @torch.inference_mode()
     def start_model(self) -> None:
+        """
+        Load the model and put it into GPU memory (if applicable). This is not done automatically when building a
+        `TextGenerator` (unless `start=True`) to save time when the model is actually not needed (e.g., decoding 
+        empty files)
+        """
+        if self.model is not None:  # do not start the model if it's already running
+            return
         models: list[Transformer] = []
         for ckpt in self.cfg.ckpt, *self.cfg.ensemble_ckpt:
             models.append(self.load_model(ckpt, *self.cfg.other_ckpt))
@@ -212,60 +233,52 @@ class TextGenerator:
             # a batch, it is moved to the CPU and the decoder is moved to the GPU)
             self.encoder.to(self.devices[0])
         else:
+            # move the model to given device(s): does pipeline parallelism if more than one device
             self.model.parallelize(self.devices)
-
-    def is_running(self) -> bool:
-        return self.model is not None
 
     def preprocess(
         self,
         samples: list[dict],
         *,  # below = keyword-only arguments
-        teacher_forcing: bool = False,
+        append_eos: bool = False,
         tokenize: bool = True,
         sort: bool = True,
         **kwargs,  # unused
     ) -> list[dict]:
+        """
+        Preprocess given samples and build batches with this model's task. The preprocessing and batching configuration
+        are handled by the task.
+        
+        If using data parallelism, the same batches are read on all replica, but each replica only keeps its own shard 
+        of each batch. For example:
+        ```
+        batch = [a, b, c, d]
+        GPU 0 -> [a, b]
+        GPU 1 -> [c, d]
+        ```
+        """
         samples = [
             self.task.preprocess(
                 sample,
                 truncate=True,
                 tokenize=tokenize,
-                inference=not teacher_forcing,
+                append_eos=append_eos,
             )
             for sample in samples
         ]
 
-        for sample in samples:
-            if sample.get('target') is not None and teacher_forcing:
-                # decoder_input (aka decoder prompt) is obtained by moving the EOS at the end of target to the beginning
-                # This is fine at training, but at inference with teacher forcing we want our prompt to end with EOS, to 
-                # prevent the model from generating any token after this.
-                # For this reason, we double the EOS at the end of target (one is already there and we add another one)
-                sample['target'] = np.append(sample['target'], self.task.eos_idx)
+        assert all(len(sample['decoder_input']) > 0 for sample in samples), 'there is nothing to prompt the decoder ' \
+            'with, please set --bos-idx to a positive value'
 
-        batch_indices = self.task.build_batches(samples, shuffle=False, sort=sort)
+        batches = self.task.build_batches(samples, shuffle=False, sort=sort)
 
-        batches = []
-
-        for indices in batch_indices:
-            # to have similar-length batches per replica
-            indices = [j for _, j in sorted(enumerate(indices), key=lambda p: p[0] % self.cfg.dp_size)]
-
-            batch = [samples[idx] for idx in indices]
-
-            batch = self.task.collate(
-                batch,
-                special_tokens=self.task.special_tokens,
-                model_type=self.task.model_type,
-                dtype=self.dtype,
-            )
-            batch['indices'] = indices
-
+        collate_fn = self.task.get_collate_fn(self.dtype)
+        for i, batch in enumerate(batches):
+            batch = collate_fn(batch)
             if self.data_parallel:
                 # in case of data parallelism, find out which part of the current batch will go on this GPU
                 batch = self.task.shard_batch(batch, shard_id=self.cfg.dp_rank, shard_count=self.cfg.dp_size)
-            batches.append(batch)
+            batches[i] = batch
 
         return batches
     
@@ -275,7 +288,19 @@ class TextGenerator:
         *,
         detokenize: bool = True,
     ) -> list[list[dict]]:
+        """
+        Called at the end of decoding to reorder the decoding hypotheses and postprocess them with `self.task`.
+        This can include: stripping special tokens or prompts, debinarization and detokenization.
+        This also converts torch tensors into numpy arrays.
         
+        Each batch should contain an 'outputs' key, of type `list[list[dict]]`, whose first dimension is the batch size,
+        second dimension is the beam size (or 1 if beam search is not used), and whose dicts contain the binary
+        outputs and scores.
+        An object of the same shape is returned, except that its dictionaries correspond to post-processed hypotheses.
+
+        Batches should also have an 'indices' key, indicating the index of each element in the original dataset (since
+        sorting by length is done to reduce padding).
+        """
         n = sum(len(batch['indices']) for batch in batches)
         hyps_reordered = [None] * n
 
@@ -294,15 +319,15 @@ class TextGenerator:
                     k: v[i] for k, v in batch.items()
                 }
                 sample_bin['meta'] = meta
+                # debinarizes and detokenizes the hypotheses and adds other 'informational' fields
+                # (e.g., tokenized source, etc.)
                 for hyp in nbest:
                     self.task.postprocess(sample_bin, hyp, detokenize=detokenize)
-                
-                # debinarizes and detokenizes
-                # the hypotheses and adds other 'informational' fields (e.g., tokenized source, etc.)
+
                 hyps_reordered[real_idx] = utils.tensor_to_array(nbest)
 
         # len(sources) * beam_size * {'tokens': str, **layer_outputs}
-        return [hyp for hyp in hyps_reordered if hyp is not None]  # filter out None, which correspond to dummy 
+        return [nbest for nbest in hyps_reordered if nbest is not None]  # filter out None, which correspond to dummy 
         # batches (happens with data parallelism when the number of batches is not a multiple of the number of GPUs)
 
     @torch.inference_mode()
@@ -349,7 +374,8 @@ class TextGenerator:
         
         # Make a copy of the model's configuration and modify it to change decoding options (e.g., beam size, 
         # max output length, etc.)
-        cfg = DecodingConfig(self.cfg)
+        cfg = DecodingConfig(self.cfg)   # FIXME: this type of instantiation doesn't work with the "defaults" attribute,
+        # "set_defaults" should be called
         unknown_opts = cfg.parse_dict(decoding_opts)
         meta = self.task.make_meta(**unknown_opts)  # options that are not in DecodingConfig are assumed to be task 
         # metadata (e.g., lang or domain)
@@ -362,8 +388,7 @@ class TextGenerator:
                 utils.warn_once(logger, 'beam search does not implement on-the-fly generation, disabling beam search')
                 cfg.beam_size = 1
 
-        if not self.is_running():
-            self.start_model()
+        self.start_model()
 
         self.task.prepare_model_for_inference(self.model, meta)
 
@@ -461,13 +486,10 @@ class TextGenerator:
 
         Args:
             - inputs: one or several inputs to translate or use as prompts. They will be batched according to the
-                decoding configuration, or the options given in `kwargs` ('batch_size', 'lines_per_batch')
+                decoding configuration, or the options given in `decoding_opts` ('batch_size', 'lines_per_batch')
             - return_scores: whether to return the score of each output token (this can slow down decoding a bit)
             - return_layers: names of the layers whose outputs should be returned (e.g., f'enc_0_self_attn' for the
                 self-attention scores at the first encoder layer)
-            - targets: list of target sequences of the same length as 'inputs', which is used to perform teacher
-                forcing (i.e., the decoder is forced to generate these sequences). This can be used to compute
-                perplexity or to generate alignments.
             - decoding_opts: dictionary containing optional decoding options that will override the ones defined when
                 loading the model (e.g., 'sampling', 'beam_size', 'max_output_len', etc.), can also contain
                 task-specific metadata (e.g., 'lang', 'source_lang', 'target_lang', 'domain')
@@ -496,8 +518,7 @@ class TextGenerator:
         self.task.check_meta(meta)  # check that the given languages and domains are supported by the model
 
         # Start the model if not already started
-        if not self.is_running():
-            self.start_model()
+        self.start_model()
         
         self.task.prepare_model_for_inference(self.model, meta)
 
@@ -506,18 +527,23 @@ class TextGenerator:
         # decoder prompt or as an encoder source depending on the type of model and task
 
         if targets:  # teacher forcing
-            cfg.beam_size = 1
-            cfg.sampling = False
-            teacher_forcing = True
+            cfg.max_output_len = 0
+            append_eos = True
             assert len(samples) == len(targets)
+            if samples and samples[0].get('target'):
+                utils.warn_once(logger, 'input will be ignored because a target was provided')
             for sample, target in zip(samples, targets):
                 sample['target'] = target
         else:
-            teacher_forcing = False
+            append_eos = False
+        
+        if cfg.max_output_len == 0:
+            cfg.beam_size = 1
+            cfg.sampling = False
 
         batches: list[dict] = self.preprocess(
             samples=samples,
-            teacher_forcing=teacher_forcing,
+            append_eos=append_eos,
             tokenize=tokenize,
         )
 
@@ -583,7 +609,7 @@ class TextGenerator:
             best_hyp = nbest[0]
             score += best_hyp.get('score', 0)
             num_words += len(best_hyp['detok'].split())
-            num_tokens += len(best_hyp['tokens'].split(' '))
+            num_tokens += len(best_hyp['tokens'])
 
         # Update metrics
         self.metrics.update('num_words', num_words)
@@ -599,7 +625,6 @@ class TextGenerator:
         buffer_size: int = 100,
         bleu_tok: Optional[str] = None,
         eval_lc: bool = False,
-        merge_bpe: bool = False,
         continue_: bool = False,
         verbose: bool = False,
         metrics: list[str] = ['chrf', 'bleu'],
@@ -609,7 +634,42 @@ class TextGenerator:
         **decoding_opts,
     ) -> list[list[dict]]:
         """
-        output: None -> write to stdout, False -> no output, str -> write to this path
+        Decode an entire corpus and optionally compute metrics.
+
+        Args:
+            - corpus: obtained by calling `task.get_inference_corpus`. Contains at least an input file (can be standard
+                input) and optional an output file and reference file.
+            - buffer_size: how many lines to read at once from corpus before batching and decoding. Larget buffers are
+                more efficient because lines in the buffer are sorted by length before batching to minimize padding
+            - continue_: if True and the output file already exists, count the number of lines in it and skip this many
+                input lines. If False, the output file is overwritten.
+            - verbose: if False, only the detokenized hypotheses are written to the output file. If True, other
+                information, like tokenized source, tokenized output, scores and alignment are written.
+            - metrics: which metrics to compute between the decoding output and the references (if any)
+            - max_lines: truncate the input to this many lines
+            - teacher_forcing: instead of auto-regressive decoding from given inputs, force the model to generate the 
+                corpus' references. This can be used to a compute a test loss or perform an alignment using the cross-
+                attention matrix
+            - return_layers: names of the layers whose outputs should be returned
+
+        Returns: the decoding outputs (in addition to writing them to given output file or to standard output).
+            See `decode()` for a description of these outputs.
+
+        Metrics are stored in `self.metrics`. Example:
+
+        ```python
+        model = TextGenerator.build('models/NLLB-200/600M_distilled.bin')
+        corpus = model.task.get_inference_corpus(
+            source_path='data/FLORES/FLORES-valid.eng_Latn',
+            ref_path='data/FLORES/FLORES-valid.fra_Latn',
+            output_path=False,  # set to None to write to standard output
+            source_lang='eng_Latn',
+            target_lang='fra_Latn',
+        )
+        out = model.decode_corpus(corpus)
+        out[0][0]['detok']  # "Lundi, des scientifiques de l'École de médecine de l'Université de Stanford [...]"
+        model.metrics.val('bleu')  # 46.18
+        ```
         """
         input_path = corpus.input_path
         output_path = corpus.output_path
@@ -627,16 +687,34 @@ class TextGenerator:
         decoding_opts = {**corpus.meta, **decoding_opts}  # will be passed to `decode` and converted into a metadata 
         # dict and DecodingConfig
 
-        inputs, refs, hyps = [], [], []
+        inputs, hyps = [], []
 
         interactive_mode = input_path is None and ref_path is None and buffer_size == 1
         input_file = corpus.input_file(rank=self.rank, world_size=self.world_size)  # if reading from standard input
         # and world_size > 1, only the first rank reads and broadcasts to the other ranks
         ref_file = corpus.ref_file()
 
+        def read_pairs(input_file, ref_file):
+            for input, ref in itertools.zip_longest(input_file, ref_file):
+                if input is None or ref is None:
+                    logger.warning(
+                        'decoding interrupted: input and reference files have a different length; '
+                        'evaluation results will be biased'
+                    )
+                    break
+                if len(input) > 0 and len(ref) > 0:  # input can be a numpy array
+                    yield input, ref
+
+        # create a virtual input file that iterates over both inpits and references
+        if ref_file:
+            input_file = read_pairs(input_file, ref_file)
+        else:
+            input_file = ((input, None) for input in input_file)
+        input_file = itertools.islice(input_file, max_lines)
+
         skip = False  # do we need to decode anything at all?
         if continue_ and output_path and os.path.isfile(output_path):
-            inputs = list(input_file)[:max_lines]
+            inputs = list(input_file)
             with open(output_path, errors='ignore') as out_file:
                 hyps = [line.strip() for line in out_file]
             
@@ -663,13 +741,8 @@ class TextGenerator:
                     hyps = []
                 else:
                     hyps = hyps[:-1]  # remove last line as it may be incomplete
-                input_file = io.StringIO()
-                input_file.writelines(line + '\n' for line in inputs[len(hyps):])
-                input_file.seek(0)
+                input_file = iter(inputs[len(hyps):])
                 inputs = inputs[:len(hyps)]
-
-            if ref_file:
-                refs = list(itertools.islice(ref_file, len(hyps)))
 
         out_files = []
         if not utils.is_master(self.cfg):
@@ -715,7 +788,7 @@ class TextGenerator:
         # TODO: make this more explicit in each task
         hyps = [{'detok': hyp_str} for hyp_str in hyps]
 
-        if not skip and not self.is_running():
+        if not skip:  # do not start the model if the decoding output is already complete
             self.start_model()
 
         if skip:
@@ -748,11 +821,16 @@ class TextGenerator:
 
         while not skip:
             buffer_refs = []
-            if ref_file is None:
-                buffer_inputs = list(itertools.islice(input_file, buffer_size))
+            buffer_inputs = list(itertools.islice(input_file, buffer_size))
+            inputs += buffer_inputs  # contains (input, ref) pairs
+            if buffer_inputs:
+                buffer_inputs, buffer_refs = zip(*buffer_inputs)
+            else:
+                break
 
-                pattern = r'!\s*(?P<name>[\w.-]+)\s*=\s*(?P<value>[\w.-]+)\s*'
-                if interactive_mode and (m := regex.fullmatch(pattern, buffer_inputs[0])):
+            if ref_file is None:
+                cmd_pattern = r'!\s*(?P<name>[\w.-]+)\s*=\s*(?P<value>[\w.-]+)\s*'
+                if interactive_mode and (m := regex.fullmatch(cmd_pattern, buffer_inputs[0])):
                     # when in interactive mode (i.e., reading from stdin with buffer_size = 1), the user can type
                     # commands, starting with "!", which will modify the decoding options. For instance:
                     # "!beam_size=1" will set the beam search size to 1 (aka greedy decoding)
@@ -765,32 +843,7 @@ class TextGenerator:
                     except ValueError as e:
                         logger.error(str(e))
                     continue
-            else:
-                buffer_inputs = []
-                for input_line, ref_line in itertools.zip_longest(input_file, ref_file):
-                    if input_line is None or ref_line is None:
-                        logger.warning('decoding interrupted: input and reference files have a different length; '
-                                       'evaluation results will be biased')
-                        break
-                    if len(input_line) > 0 and len(ref_line) > 0:
-                        buffer_inputs.append((input_line, ref_line))
-                    if len(buffer_inputs) >= buffer_size:
-                        break
-                if buffer_inputs:
-                    buffer_inputs, buffer_refs = zip(*buffer_inputs)
 
-            if max_lines and len(inputs) + len(buffer_inputs) > max_lines:
-                k = max_lines - len(inputs)
-                buffer_inputs = buffer_inputs[:k]
-                buffer_refs = buffer_refs[:k]
-                skip = True
-
-            inputs += buffer_inputs
-            refs += buffer_refs
-
-            if not buffer_inputs:
-                break
-            
             buffer_outputs = self.decode(
                 *buffer_inputs,
                 return_scores=verbose,
@@ -829,7 +882,9 @@ class TextGenerator:
             for k, v in gate_stats.items():
                 write(f'MOE\t{k}\t' + ' '.join(f'{x:.6f}' for x in v))
 
-        if not refs:
+        inputs, refs = zip(*inputs)
+
+        if ref_file is None:
             metrics = []
         for metric in metrics:
             score = self.task.compute_score(
@@ -838,7 +893,6 @@ class TextGenerator:
                 refs,
                 bleu_tok=bleu_tok,
                 eval_lc=eval_lc,
-                merge_bpe=merge_bpe,
             )
             self.metrics.update(metric, score)
 
@@ -875,7 +929,7 @@ def should_stop(decoder_output: LongTensor, stop_sequences: list[LongTensor]) ->
     
     has_stop_sequence = []
     for stop_seq in stop_sequences:
-        if seq_len >= len(stop_seq):
+        if len(stop_seq) > 0 and seq_len >= len(stop_seq):
             has_stop_sequence.append(
                 (decoder_output[:,-len(stop_seq):] == stop_seq).all(dim=1)
             )
@@ -940,7 +994,6 @@ def sampling(
         src_mask_ = None if src_mask is None else src_mask[i]
         uncollate(
             hyp,
-            eos_idx=decoder.eos_idx,
             padding_idx=decoder.padding_idx,
             src_mask=src_mask_,
         )
@@ -966,7 +1019,6 @@ def sample_on_the_fly(
     sharded: bool = False,
     device: str = None,
     repeat_penalty: float = 1.0,
-    min_output_len: int = 0,
     blacklist: list[int] = [],
     stop_sequences: list[LongTensor] = [],
     **kwargs,  # unused
@@ -1033,12 +1085,11 @@ def sample_on_the_fly(
         dist.all_reduce(min_prompt_len, op=dist.ReduceOp.MIN)
         dist.all_reduce(max_prompt_len, op=dist.ReduceOp.MAX)
 
-    start = min_prompt_len  # FIXME: this will cause shorter prompts to generate more tokens than 'max_output_len'.
-    # Force the generation of EOS to solve this.
-    
+    start = min_prompt_len
     max_len = min(decoder.max_len, max_prompt_len + max_output_len)
     assert max_len >= 1
-
+    start = min(start, max_len - 1)  # to ensure that we do at least one decoding step
+    
     tokens = torch.full(
         (batch_size, max_len),
         decoder.padding_idx,
@@ -1053,16 +1104,21 @@ def sample_on_the_fly(
     all_finished = torch.tensor(False, device=device)
 
     eos_idx = decoder.eos_idx
+    pad_idx = decoder.padding_idx
+    
     # sequences of ids that should be interpreted as end-of-generation
     stop_sequences = list(stop_sequences)
     stop_sequences.append(LongTensor([eos_idx]))
     stop_sequences = utils.move_to_device(stop_sequences, device)
+
     has_eos = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
     prev_step = 0
     incremental_state = {}
 
     for step in range(start, max_len):
+        has_eos = torch.logical_or(has_eos, step >= prompt_len + max_output_len)
+
         logits, dec_layer_output = decoder(
             encoder_outputs, encoder_masks, tokens[:,prev_step:step],
             state=incremental_state,
@@ -1098,17 +1154,10 @@ def sample_on_the_fly(
         for token in blacklist:
             next_logit[:,token] = -torch.inf
 
-        if step < start + min_output_len:
-            # prevent the generation of end-of-sequence tokens until the minimum length is reached
-            for stop_seq in stop_sequences:
-                if len(stop_seq) == 1:
-                    stop_token = stop_seq[0]
-                    next_logit[:,stop_token] = -torch.inf
-        
         # when a sequence is finished, put all logits to -inf except for EOS
-        eos_prob = next_logit[:,eos_idx].clone()
+        pad_prob = next_logit[:,pad_idx].clone()
         next_logit.masked_fill_(has_eos.unsqueeze(1), -torch.inf)
-        next_logit[:,eos_idx] = eos_prob
+        next_logit[:,pad_idx] = pad_prob
 
         if sampling_temperature == 0 or sampling_topk == 1:   # greedy search
             next_token = next_logit.argmax(dim=-1)
@@ -1359,7 +1408,7 @@ def beam_search(
 
         for token in blacklist:
             scores[:,token] = -torch.inf
-        
+
         if step < max_prompt_len:
             # put -inf everywhere except at prompt tokens, when applicable
             forced = tokens[:,step]
@@ -1368,7 +1417,7 @@ def beam_search(
             mask = (forced != decoder.padding_idx) & (forced != decoder.eos_idx)
             scores.masked_fill_(mask.unsqueeze(1), -torch.inf)
             scores[idx, forced] = scores_forced
-        
+
         if hyp_scores is None:
             # at the first step, all K candidates have the same scores, only keep the first one
             scores = scores[::beam_size]
@@ -1384,13 +1433,14 @@ def beam_search(
         # indices in [0, B*K) of the beams that are being continued (for selection within B*K flattened dimension)
         beam_indices = beam_indices_ + beam_offset     # B x K*2
         vocab_indices = topk.indices.fmod(vocab_size)  # B x K*2 (token indices)
-        hyp_scores = topk.values                           # B x K*2
+        hyp_scores = topk.values                       # B x K*2
 
         eos_mask = vocab_indices.eq(decoder.eos_idx)   # B x K*2
         eos_mask &= ~hyp_scores.isinf()   # if EOS has -inf, it should be ignored (this can happen when fewer than
         # K*2 tokens have a non-inf score)
-        # FIXME: this might detect EOS in the prompt and stop too early
-        
+        eos_mask = torch.logical_and(eos_mask, (step >= prompt_len[batch_id_mapping]).unsqueeze(1))  # do not count 
+        # EOS that are in the prompt as EOS
+
         # list of L indices in [0, B*K) identifying partial hypotheses (in `tokens`) that are in the top-K when
         # continued with EOS
         eos_beam_indices = torch.masked_select(beam_indices[:, :beam_size], mask=eos_mask[:, :beam_size])
@@ -1600,7 +1650,6 @@ def beam_search(
         for hyp in nbest:
             uncollate(
                 hyp,
-                eos_idx=decoder.eos_idx,
                 padding_idx=decoder.padding_idx,
                 src_mask=src_mask_,
             )
@@ -1609,17 +1658,24 @@ def beam_search(
 
 def uncollate(
     hypothesis: list[dict],
-    eos_idx: int,
     padding_idx: int,
     src_mask: Optional[BoolTensor] = None,
+    max_len: Optional[int] = None,
 ) -> None:
     """
     Post-processes (in-place modification) a list of decoding hypotheses by truncating layer outputs to remove values
-    corresponding to padding tokens or after the EOS
+    corresponding to padding tokens
     """
-    hyp_mask = torch.BoolTensor(mask_padding(hypothesis['tokens'], eos_idx=eos_idx, padding_idx=padding_idx))
+    hypothesis.setdefault('tokens', LongTensor())
+    # Mask that is True at padding positions
+    hyp_mask = torch.BoolTensor([idx == padding_idx for idx in hypothesis['tokens']])
+    if max_len is not None:
+        hyp_mask[max_len:] = True
 
-    # Filter layer outputs to remove those of padding tokens, or of tokens that are after the eos
+    max_len = (~hyp_mask).sum()
+    hypothesis['tokens'] = hypothesis['tokens'][:max_len]
+
+    # Filter layer outputs to remove those of padding tokens
     for k, v in hypothesis.items():
         if v is None:
             continue
@@ -1669,16 +1725,16 @@ class EnsembleEncoder(Encoder):
         return self.encoders[0].max_len
 
     def forward(self, *args, **kwargs) -> tuple[list[Tensor], list[BoolTensor], dict[str, Tensor]]:
-        encoder_outputs, encoder_padding_masks, enc_layer_outputs = zip(
+        encoder_outputs, encoder_masks, enc_layer_outputs = zip(
             *[encoder(*args, **kwargs) for encoder in self.encoders]
         )
         if all(encoder_out is None for encoder_out in encoder_outputs):  # decoder-only
-            encoder_outputs = encoder_padding_masks = None
+            encoder_outputs = encoder_masks = None
         else:
             encoder_outputs = list(encoder_outputs)  # zip returns tuples
-            encoder_padding_masks = list(encoder_padding_masks)
+            encoder_masks = list(encoder_masks)
         enc_layer_output = enc_layer_outputs[0]  # only return layer outputs of the first encoder in the ensemble
-        return encoder_outputs, encoder_padding_masks, enc_layer_output
+        return encoder_outputs, encoder_masks, enc_layer_output
 
 
 class EnsembleDecoder(Decoder):

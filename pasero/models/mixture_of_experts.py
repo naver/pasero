@@ -9,12 +9,12 @@ import numpy as np
 import torch.nn as nn
 from typing import Optional
 from torch import Tensor, BoolTensor, LongTensor
-from .transformer import Transformer, TransformerEncoder, TransformerDecoder
+from .transformer import DummyEncoder, Transformer, TransformerEncoder, TransformerDecoder
 from .transformer import TransformerEncoderLayer, TransformerDecoderLayer
 from . import modules
 from .modules import Embedding, Expert
 from pasero import utils
-from pasero.config import MOETransformerConfig, DistributedConfig
+from pasero.config import register_model, MOETransformerConfig, DistributedConfig
 
 
 logger = logging.getLogger('mixture_of_experts')
@@ -85,17 +85,19 @@ class FusedMixtureOfExperts(nn.Module):
         local_expert_count: int,
         global_expert_count: int,
         activation_fn: str = 'relu',
+        has_bias: bool = True,
         **kwargs,
     ):
         super().__init__()
         assert global_expert_count >= 2
         assert local_expert_count == global_expert_count
+        assert activation_fn not in ('swiglu', 'geglu')
         self.embed_dim = embed_dim
         self.expert_dim = expert_dim
         self.expert_count = global_expert_count
         self.gate = Top2Gate(embed_dim, self.expert_count, use_fp32=True)
-        self.fc1 = modules.Linear(embed_dim, self.expert_count * expert_dim)
-        self.fc2 = modules.Linear(expert_dim, self.expert_count * embed_dim)
+        self.fc1 = modules.Linear(embed_dim, self.expert_count * expert_dim, has_bias=has_bias)
+        self.fc2 = modules.Linear(expert_dim, self.expert_count * embed_dim, has_bias)
         self.activation_fn = modules.get_activation_fn(activation_fn)
 
     @utils.disable_logging()
@@ -118,7 +120,8 @@ class FusedMixtureOfExperts(nn.Module):
         x = self.activation_fn(x)
         x = x.view(-1, ec, self.expert_dim)
         w = self.fc2.weight.view(ec, self.embed_dim, self.expert_dim)
-        b = self.fc2.bias.view(ec, self.embed_dim)
+        if self.fc2.bias is not None:
+            b = self.fc2.bias.view(ec, self.embed_dim)
         x = torch.einsum('beh,edh->bed', x, w) + b  # (BxT)xExD
         # multiply the expert outputs by their weights:
         x = (x * gate_weights).sum(dim=1)
@@ -145,6 +148,7 @@ class BasicMixtureOfExperts(nn.Module):
         local_expert_count: int,
         global_expert_count: int,
         activation_fn: str = 'relu',
+        has_bias: bool = True,
         **kwargs,
     ):
         super().__init__()
@@ -155,7 +159,7 @@ class BasicMixtureOfExperts(nn.Module):
         self.expert_count = global_expert_count
         self.gate = Top2Gate(embed_dim, self.expert_count, use_fp32=True)
         self.experts = nn.ModuleList([
-            Expert(embed_dim, expert_dim, activation_fn=activation_fn)
+            Expert(embed_dim, expert_dim, activation_fn=activation_fn, has_bias=has_bias)
             for _ in range(self.expert_count)
         ])
 
@@ -177,7 +181,8 @@ class BasicMixtureOfExperts(nn.Module):
         expert_out = 0
         for expert_id, expert in enumerate(self.experts):
             weight = gate_weights[:, expert_id]
-            expert_out += weight * expert(x)
+            if weight.sum() > 0:  # skip this expert if it unused
+                expert_out += weight * expert(x)
         x = expert_out
         
         x = x.view(bsz, seq_len, -1)
@@ -204,10 +209,12 @@ class TutelMixtureOfExperts(nn.Module):
         global_expert_count: int,
         capacity_factor: Optional[int] = None,
         activation_fn: str = 'relu',
+        has_bias: bool = True,
         **kwargs,
     ):
         super().__init__()
         assert local_expert_count >= 2 and global_expert_count % local_expert_count == 0
+        assert activation_fn not in ('swiglu', 'geglu')
         self.embed_dim = embed_dim
         self.expert_dim = expert_dim
         self.local_expert_count = local_expert_count
@@ -225,6 +232,8 @@ class TutelMixtureOfExperts(nn.Module):
                 'type': 'ffn',
                 'hidden_size_per_expert': self.expert_dim,
                 'activation_fn': modules.get_activation_fn(activation_fn),
+                'has_fc1_bias': has_bias,
+                'has_fc2_bias': has_bias,
             },
             scan_expert_func=(lambda name, param: setattr(param, '_is_sharded', True)),  # used by DDP to avoid
             # syncing expert parameters
@@ -399,6 +408,7 @@ class MOETransformerEncoderLayer(TransformerEncoderLayer):
         assert dist_cfg.tp_size == 1, 'tensor parallelism is not supported for mixtures of expert'
         del self.fc1
         del self.fc2
+        del self.fc3
         expert_count = cfg.encoder_expert_count
         expert_count = expert_count.get(layer_id) if isinstance(expert_count, dict) else expert_count
         expert_count = expert_count or 0
@@ -417,6 +427,7 @@ class MOETransformerEncoderLayer(TransformerEncoderLayer):
             global_expert_count=expert_count,
             capacity_factor=cfg.capacity_factor,
             activation_fn=cfg.activation_fn,
+            has_bias=cfg.has_bias,
         )
         self.gate_key = f'{self.name}_gate'
 
@@ -435,6 +446,7 @@ class MOETransformerDecoderLayer(TransformerDecoderLayer):
         assert dist_cfg.tp_size == 1, 'tensor parallelism is not supported for mixtures of expert'
         del self.fc1
         del self.fc2
+        del self.fc3
         expert_count = cfg.decoder_expert_count
         expert_count = expert_count.get(layer_id) if isinstance(expert_count, dict) else expert_count
         expert_count = expert_count or 0
@@ -453,6 +465,7 @@ class MOETransformerDecoderLayer(TransformerDecoderLayer):
             global_expert_count=expert_count,
             capacity_factor=cfg.capacity_factor,
             activation_fn=cfg.activation_fn,
+            has_bias=cfg.has_bias,
         )
         self.gate_key = f'{self.name}_gate'
 
@@ -493,6 +506,7 @@ class MOETransformerDecoder(TransformerDecoder):
         return modules.checkpoint_wrapper(layer, activate=self.cfg.checkpoint_activations)
 
 
+@register_model('moe_transformer')
 class MOETransformer(Transformer):
     """
     There are two implementations of mixture-of-experts Transformer:
@@ -525,12 +539,15 @@ class MOETransformer(Transformer):
         super().parallelize(devices)
     
     def build_encoder(self, embed: Optional[Embedding] = None) -> MOETransformerEncoder:
-        return MOETransformerEncoder(
-            self.cfg,
-            self.dist_cfg,
-            self.task,
-            embed=embed,
-        )
+        if self.cfg.model_type == 'decoder':
+            return DummyEncoder()
+        else:
+            return MOETransformerEncoder(
+                self.cfg,
+                self.dist_cfg,
+                self.task,
+                embed=embed,
+            )
     
     def build_decoder(self, embed: Optional[Embedding] = None) -> MOETransformerDecoder:
         return MOETransformerDecoder(

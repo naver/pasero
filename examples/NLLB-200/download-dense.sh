@@ -18,7 +18,9 @@ for path in 3.3B_dense.bin 1.3B_distilled.bin 600M_distilled.bin; do
 python3 -c "
 import torch
 ckpt = torch.load('$path')
-ckpt.pop('last_optimizer_state')  # remove optimizer states which are very large
+# remove optimizer states which are very large
+ckpt.pop('last_optimizer_state', None)
+ckpt.pop('optimizer_history', None)
 # replace duplicated shared parameters by references
 ckpt['model']['decoder.embed_tokens.weight'] = ckpt['model']['encoder.embed_tokens.weight']
 ckpt['model']['decoder.output_projection.weight'] = ckpt['model']['encoder.embed_tokens.weight']

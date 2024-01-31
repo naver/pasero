@@ -12,8 +12,8 @@ from typing import Optional
 
 logger = logging.getLogger('decode')
 
-from pasero import utils, decoding, tasks
-from pasero.config import DecodingCLIConfig
+from pasero import utils, decoding
+from pasero.config import get_task_class, DecodingCLIConfig
 
 
 def log(
@@ -35,7 +35,6 @@ def log(
         ('wpb {:.2f}', metrics.divide('num_tokens', 'steps')),
         ('bsz {:.2f}', metrics.divide('num_lines', 'steps')),
     ]
-    data_to_log = {}
     for name in metrics.names:
         if 'mem' in name:
             metrics_.append((f'{name} {{:.1f}}', metrics.max(name)))
@@ -81,7 +80,7 @@ def run_decoding(cfg: DecodingCLIConfig):
     for k, v in sys_info.items():
         logger.info(f'{k} {v}')
 
-    task_cls = tasks.get_task_class(cfg.task)
+    task_cls = get_task_class(cfg.task)
 
     # Replace placeholders in input, output and reference files with the correct languages, infer languages 
     # from filenames if needed, and make all lists the same length
@@ -115,7 +114,7 @@ def run_decoding(cfg: DecodingCLIConfig):
         generator.decode_corpus(corpus, buffer_size=cfg.buffer_size, bleu_tok=cfg.bleu_tok,
                                 eval_lc=cfg.eval_lc, continue_=cfg.continue_, verbose=cfg.verbose,
                                 metrics=cfg.metrics, max_lines=cfg.max_lines,
-                                teacher_forcing=cfg.teacher_forcing, merge_bpe=cfg.merge_bpe)
+                                teacher_forcing=cfg.teacher_forcing)
 
         prefix = corpus.corpus_id
         for k, v in utils.benchmark.metrics.items():

@@ -19,6 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 try:
     from flash_attn import flash_attn_func
+    assert torch.cuda.get_device_capability()[0] >= 8
 except:
     flash_attn_func = None
 
@@ -228,16 +229,19 @@ def get_activation_fn(activation_fn: str = 'relu'):
 
 
 class Expert(nn.Module):
-    def __init__(self, embed_dim: int, expert_dim: int, activation_fn: str = 'relu') -> None:
+    def __init__(self, embed_dim: int, expert_dim: int, activation_fn: str = 'relu', has_bias: bool = True) -> None:
         super().__init__()
-        self.fc1 = Linear(embed_dim, expert_dim)
-        self.fc2 = Linear(expert_dim, embed_dim)
+        self.fc1 = Linear(embed_dim, expert_dim, bias=has_bias)
+        self.fc2 = Linear(expert_dim, embed_dim, bias=has_bias)
+        self.fc3 = Linear(embed_dim, expert_dim, bias=has_bias) if activation_fn in ('swiglu', 'geglu') else None
         self.activation_fn = get_activation_fn(activation_fn)
     
     def forward(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
-        x = self.activation_fn(x)
-        x = self.fc2(x)
+        y = self.fc1(x)
+        y = self.activation_fn(y)
+        if self.fc3 is not None:
+            y = y * self.fc3(x)
+        x = self.fc2(y)
         return x
 
 
@@ -308,9 +312,9 @@ class AdapterLayer(nn.Module):
             else Identity()
         )
         if self.zero_init:
-            # # same init as in the LoRA paper, can also be used to at inference to have adapters that return zero, i.e.,
-            # # default to the identity function (lets the user disable adapters at some layers by just removing them
-            # # from the checkpoint)
+            # same init as in the LoRA paper, can also be used to at inference to have adapters that return zero, i.e.,
+            # default to the identity function (lets the user disable adapters at some layers by just removing them
+            # from the checkpoint)
             # nn.init.normal_(self.down.weight, std=1/self.projection_dim)
             nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
             nn.init.zeros_(self.up.weight)
@@ -322,9 +326,12 @@ class AdapterLayer(nn.Module):
             nn.init.zeros_(self.down.bias)
             nn.init.zeros_(self.up.bias)
 
+    def enable(self) -> None:
+        if self.down is not None:  # not permanently disabled
+            self.disabled = False
+
     def disable(self) -> None:
         self.disabled = True
-        self.down = self.up = self.layer_norm = None
 
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -346,6 +353,7 @@ class AdapterLayer(nn.Module):
         # At inference, automatically disable adapters that are missing from checkpoint
         if not self.training and prefix + 'down.weight' not in state_dict:
             self.disable()
+            self.up = self.down = self.layer_norm = None  # disable permanently
             logger.warning(f"missing adapter '{prefix.rstrip('.')}', disabling it")
         # At inference, automatically change the bottleneck dimension of the adapters to match that of the 
         # checkpoint
@@ -503,7 +511,7 @@ class MultiheadAttention(nn.Module):
         self.has_bias = has_bias
         self.sliding_window = sliding_window
         if sliding_window and flash_attn_func is None:
-            utils.warn_once('flash-attention is not installed: disabling the sliding window')
+            utils.warn_once(logger, 'flash-attention is not installed: disabling the sliding window')
         
         self.k_proj = Linear(
             embed_dim,
@@ -573,26 +581,28 @@ class MultiheadAttention(nn.Module):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        key_padding_mask: Optional[BoolTensor] = None,
+        attn_mask: Optional[BoolTensor] = None,
         state: Optional[dict[str, Tensor]] = None,
         return_attn: bool = False,
     ) -> tuple[Tensor, Tensor, dict]:
         """
         Args:
-            key_padding_mask: boolean tensor with True at masked (key, value) positions
+            attn_mask: boolean tensor with True at masked (key, value) positions
         
         Shape:
             query: (B, T, D)
             key:   (B, S, D)
             value: (B, S, D)
-            key_padding_mask: (B, S)
+            attn_mask: (B, S) or (B, T, S)
         
         Returns: tuple (attn, attn_weights) with
             attn: tensor of shape (B, T, D)
             attn_weights: tensor of shape (B, T, H, S) or None
         """
-        if self.causal:
-            assert key_padding_mask is None
+        if attn_mask is not None and attn_mask.dim() == 2 and self.causal:
+            # attn_mask can be a simple padding mask, in which case it is useless for causal attention (assuming the
+            # padding tokens are always at the end...)
+            attn_mask = None  # set to None to allow the use of fast causal attention below
 
         batch_size, tgt_len, embed_dim = query.size()
         src_len = key.size(1)
@@ -635,16 +645,21 @@ class MultiheadAttention(nn.Module):
             v = v.repeat_interleave(r, dim=2)
             k = k.repeat_interleave(r, dim=2)
 
-        attn_mask = None
-
         if (
             return_attn or  # Pytorch's `dot_product_attention` does not return attention scores
-            not self.causal or  # bi-directional attention should not be applied to padding tokens
+            attn_mask is not None or 
             self.alibi is not None or  # ALiBi applies a bias to the attention scores
             self.t5_embed is not None  # T5 applies a bias to the attention scores
         ):  # custom masking
             device = q.device
             dtype = q.dtype
+
+            if attn_mask is None:
+                pass
+            elif attn_mask.dim() == 2:  # BxS
+                attn_mask = attn_mask[:,None,None,:]  # Bx1x1xS
+            else:  # BxTxS
+                attn_mask = attn_mask[:,None]  # Bx1xTxS
 
             if self.causal:
                 if self.causal_mask.size(0) < src_len:
@@ -655,11 +670,9 @@ class MultiheadAttention(nn.Module):
                 self.causal_mask = self.causal_mask.to(device)
                 causal_mask = self.causal_mask[:src_len, :src_len]
                 causal_mask = causal_mask[-tgt_len:]
-                attn_mask = causal_mask.view(1, 1, tgt_len, src_len)  # 1x1xTxS
+                causal_mask = causal_mask.view(1, 1, tgt_len, src_len)  # 1x1xTxS
+                attn_mask = causal_mask if attn_mask is None else (attn_mask + causal_mask)
             
-            elif key_padding_mask is not None:  # BxS
-                attn_mask = key_padding_mask[:,None,None,:]  # Bx1x1xS
-
             if attn_mask is not None:
                 attn_mask = attn_mask.to(dtype).masked_fill(attn_mask, -float('inf'))  # bool -> float
 
@@ -673,21 +686,15 @@ class MultiheadAttention(nn.Module):
         dropout_p = self.dropout if self.training else 0
         scale = None if self.scaled else 1.0
         is_causal = self.causal and tgt_len > 1 and attn_mask is None
-        
-        if return_attn or flash_attn_func is None and not hasattr(F, 'scaled_dot_product_attention'):
-            # use custom attention if we need the attention weights or flash attention is not available (e.g., 
-            # Pytorch version that is too old)
-            q = q.transpose(1, 2)  # BxHxTxD'
-            k = k.transpose(1, 2)  # BxHxSxD'
-            v = v.transpose(1, 2)  # BxHxSxD'
-            attn, attn_weights = self.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                scale=scale
-            )  # BxHxTxD'
-            attn = attn.transpose(1, 2)
-        elif flash_attn_func is not None and attn_mask is None:
+        use_flash_attn = (
+            flash_attn_func is not None and
+            q.dtype != torch.float32 and
+            attn_mask is None and
+            not return_attn
+        )
+
+        if use_flash_attn:
+            utils.log_once(logger, 'using flash attention', level=logging.DEBUG)
             window_size = (self.sliding_window or -1, self.sliding_window or -1)
             attn: Tensor = flash_attn_func(
                 q, k, v,
@@ -697,7 +704,8 @@ class MultiheadAttention(nn.Module):
                 window_size=window_size,
             )  # BxTxHxD'
             attn_weights = None
-        else:
+        elif not return_attn and hasattr(F, 'scaled_dot_product_attention'):
+            utils.log_once(logger, 'using torch attention', level=logging.DEBUG)
             q = q.transpose(1, 2)  # BxHxTxD'
             k = k.transpose(1, 2)  # BxHxSxD'
             v = v.transpose(1, 2)  # BxHxSxD'
@@ -709,6 +717,20 @@ class MultiheadAttention(nn.Module):
                 scale=scale,
             )  # BxHxTxD'
             attn_weights = None
+            attn = attn.transpose(1, 2)
+        else:
+            utils.log_once(logger, 'using custom attention', level=logging.DEBUG)
+            # use custom attention if we need the attention weights or flash attention is not available (e.g., 
+            # Pytorch version that is too old)
+            q = q.transpose(1, 2)  # BxHxTxD'
+            k = k.transpose(1, 2)  # BxHxSxD'
+            v = v.transpose(1, 2)  # BxHxSxD'
+            attn, attn_weights = self.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                scale=scale
+            )  # BxHxTxD'
             attn = attn.transpose(1, 2)
         
         attn = attn.reshape(batch_size, tgt_len, -1)  # BxTxD
@@ -838,7 +860,7 @@ def remove_unused_parameters(
                 module, uid = match.groups()
                 unused_uids[module].add(uid)
     for module, uids in unused_uids.items():
-        logger.info(f'found {len(uids)} set(s) of unused {module} params: ' + ', '.join(sorted(uids)))
+        logger.warning(f'found {len(uids)} set(s) of unused {module} params: ' + ', '.join(sorted(uids)))
     return unused_params
 
 
@@ -859,7 +881,7 @@ def add_missing_parameters(model: nn.Module, state_dict: dict, param_regex: Opti
                 if module is not None and uid is not None:
                     missing_uids[module].add(uid)
     for module, uids in missing_uids.items():
-        logger.info(
+        logger.warning(
             f'missing {module} params initialized at random: ' +
             ', '.join(sorted(uids))
         )

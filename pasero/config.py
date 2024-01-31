@@ -8,8 +8,136 @@ import os
 import copy
 import yaml
 import random
-from typing import Optional, Union, Any, get_args, get_origin
+from typing import Optional, Union, Callable, Any, get_args, get_origin
 from pasero import evaluation
+
+
+TASKS = {}
+DATASETS = {}
+MODELS = {}
+MODEL_CONFIGS = {}
+
+
+def register_task(name: str):
+    """
+    Decorator for task classes (which should subclass `Task`). Such task classes should have a `cfg` type annotation 
+    that indicates their configuration class (subclass of `TaskConfig`).
+    
+    The given `name` will be used to find this task and its configuration (e.g., with the `--task` option).
+
+    Note that this task won't be registered if the class is not imported in 'tasks/__init__.py'
+    """
+    def wrapper(task_cls):
+        cfg_cls = task_cls.__annotations__.get('cfg')
+        assert cfg_cls is not None, f"class '{task_cls.__name__}' has no 'cfg' annotation"
+        assert issubclass(cfg_cls, TaskConfig), (
+            f"the 'cfg' annotation of '{task_cls.__name__}' is not a subclass of 'TaskConfig'"
+        )
+        TASKS[name] = (task_cls, cfg_cls)
+        return task_cls
+    return wrapper
+
+def get_task_class(name: str):
+    assert name in TASKS, (
+        f"there is no class named '{name}', did you forget to register your task with `register_task`?"
+    )
+    return TASKS[name][0]
+
+def get_task_config_cls(name: str) -> type['TaskConfig']:
+    assert name in TASKS, (
+        f"there is no class named '{name}', did you forget to register your task with `register_task`?"
+    )
+    return TASKS[name][1]
+
+
+def register_dataset(name: str):
+    """
+    Decorator for dataset classes (which should subclass `TrainingDataset`). Such task classes should have a `cfg` type 
+    annotation that indicates their configuration class (subclass of `TrainingDatasetConfig`).
+    
+    The given `name` will be used to find this dataset and its configuration (e.g., with the `--dataset-type` option).
+    """
+    def wrapper(dataset_cls):
+        cfg_cls = dataset_cls.__annotations__.get('cfg')
+        assert cfg_cls is not None, f"class '{dataset_cls.__name__}' has no 'cfg' annotation"
+        assert issubclass(cfg_cls, TrainingDatasetConfig), (
+            f"the 'cfg' annotation of '{dataset_cls.__name__}' is not a subclass of 'TrainingDatasetConfig'"
+        )
+        DATASETS[name] = (dataset_cls, cfg_cls)
+        return dataset_cls
+    return wrapper
+
+def get_dataset_class(name_or_cfg: Union[str, 'TrainingDatasetConfig']):
+    if isinstance(name_or_cfg, str):
+        assert name_or_cfg in DATASETS, (
+            f"there is no class named '{name_or_cfg}', did you forget to register your dataset with `register_dataset`?"
+        )
+        return DATASETS[name_or_cfg][0]
+    else:
+        dataset_cls = next(
+            (dataset_cls for dataset_cls, cfg_cls in DATASETS.values() if type(name_or_cfg) is cfg_cls),
+            None
+        )
+        assert dataset_cls is not None, f"there is no registered dataset class whose cfg is '{type(name_or_cfg)}'"
+        return dataset_cls
+
+def get_dataset_config_cls(name: str) -> type['TrainingDatasetConfig']:
+    assert name in DATASETS, (
+        f"there is no class named '{name}', did you forget to register your dataset with `register_dataset`?"
+    )
+    return DATASETS[name][1]
+
+
+def register_model(name: str):
+    """
+    Decorator for model classes (which should subclass `Transformer`). A model configuration should be registered 
+    under the same name with `register_model_config`.
+    
+    Note that this model won't be registered if the class is not imported in 'models/__init__.py'
+    """
+    def wrapper(model_cls):
+        MODELS[name] = model_cls
+        return model_cls
+    return wrapper
+
+def get_architecture(name_or_cfg: Union[str, 'TransformerConfig']):
+    """
+    Return the model class corresponding to the given architecture name or model configuration.
+    For instance: 'adapter_transformer_small' -> AdapterTransformer
+    """
+    if isinstance(name_or_cfg, str):
+        assert name_or_cfg in MODELS, (
+            f"there is no class named '{name_or_cfg}', did you forget to register your model with `register_model`?"
+        )
+        return MODELS[name_or_cfg]
+    else:
+        for cfg_cls in name_or_cfg.__class__.__mro__:
+            arch = cfg_cls._arch
+            if arch in MODELS:
+                return MODELS[arch]
+        raise ValueError(
+            f"the name of '{type(name_or_cfg)}' does not match any registered architecture: make sure this class "
+            f"or one of its parents is registered under the same name as an existing model (e.g., 'transformer' "
+            f"or 'adapter_transformer')"
+        )
+
+def register_model_config(*names: str):
+    """
+    Decorator for model configurations (which should subclass `TransformerConfig`). The first name of this configuration
+    or of one of its parents should match the name of a model registered with `register_model`.
+    """
+    assert len(names) >= 1
+    def wrapper(cls):
+        cls._arch = names[0]
+        for name in names:
+            MODEL_CONFIGS[name] = cls
+        return cls
+    return wrapper
+
+def get_model_config_cls(arch: str) -> type['TransformerConfig']:
+    assert arch in MODEL_CONFIGS, f'unknown architecture: {arch}'
+    return MODEL_CONFIGS[arch]
+
 
 
 class argument:
@@ -19,7 +147,7 @@ class argument:
         defaults: Optional[dict[str, Any]] = None,
         help: Optional[str] = None,
         aliases: list[str] = [],
-        choices: Optional[list[Any]] = None,
+        choices: Union[list[str], Callable[[], str], None] = None,
         nargs: Union[str, int, None] = None,
         positional: bool = False,
     ):
@@ -29,10 +157,15 @@ class argument:
         self.defaults = defaults
         self.help = help
         self.aliases = aliases
-        self.choices = choices
+        self.choices_fn = choices if callable(choices) else (lambda: choices)  # choices can be a list or a function
+        # that returns a list (for choices that are defined dynamically, like task names)
         self.nargs = nargs
         self.positional = positional
         self.api_opt = not positional
+    
+    @property
+    def choices(self):
+        return self.choices_fn()
 
 
 def is_optional(type_):
@@ -358,7 +491,7 @@ class Config:
 def parse_help(*configs: list[Config]):
     if '-h' in sys.argv or '--help' in sys.argv:
         parsers = [
-            cfg.get_parser(add_help=False) for cfg in configs
+            cfg._get_parser(add_help=False) for cfg in configs
         ]
         parser = argparse.ArgumentParser(parents=parsers, conflict_handler='resolve')
         parser.parse_args(['-h'])
@@ -402,7 +535,7 @@ class DistributedConfig(Config):
     dp_rank: int = 0
     tp_rank: int = 0
     dp_local_rank: int = 0
-    dp_local_size: int = 1
+    dp_local_size: int = 1  # how many GPUs are used for data parallelism on this node
     
     @property
     def distributed_world_size(self):
@@ -431,10 +564,6 @@ class DecodingConfig(Config):
     max_output_len: int = argument(
         default=100,
         help='maximum number of new new tokens to be generated (does not count the length of the prompt)'
-    )
-    min_output_len: int = argument(
-        default=0,
-        help='minimum number of new new tokens to be generated (does not count the length of the prompt)'
     )
     beam_size: Optional[int] = argument(
         defaults={
@@ -469,7 +598,6 @@ class DecodingConfig(Config):
     )
 
 
-
 class EvalConfig(Config):
     teacher_forcing: bool = argument(
         default=False,
@@ -493,11 +621,6 @@ class EvalConfig(Config):
             'translation': ['chrf', 'bleu', 'chrf++', 'spbleu', 'len_ratio'],
         },
         help='evaluation metrics to compute'
-    )
-    merge_bpe: bool = argument(
-        default=False,
-        help="used in conjunction with '--tokenizer none' when the data is pre-tokenized: detokenizes both the "
-             "hypotheses and references before BLEU evaluation"
     )
 
 
@@ -540,28 +663,15 @@ class PreprocessingConfig(NoiseConfig):
     tokenizer_path: Optional[str] = argument(
         help="path to the BPE model, absolute or relative to DATA_DIR (at training) or MODEL_DIR (at inference)"
     )
-    tokenizer_vocab: Optional[str] = argument(
-        help="path to the vocabulary countaining BPE token frequencies used for threshold-based filtering (if any)"
-    )
-    hf_add_prefix_space: bool = argument(
-        default=False,
-        help='the BLOOM tokenizer treats the first word in the sentence differently, get around this behavior by '
-             'prefixing each sentence with a whitespace'
-    )
-    vocabulary_threshold: Optional[int] = argument(
-        help='prevent any BPE token whose frequency is lower than this threshold from being generated (frequencies are '
-             'obtained from the vocabulary file specified with --tokenizer-vocab). If not set to zero or not set and '
-             '--tokenizer-vocab VOCAB is set, only subwords appearing in VOCAB will be allowed'
-    )
     inline_case: bool = argument(
         default=False,
         help='apply inline casing: put all text to lowercase and add special tokens indicating the case '
              'of the preceding subword (inline casing is activated by default with --tokenizer pasero)'
     )
-    dict: str = argument(
+    dict: Optional[str] = argument(
         aliases=['--source-dict'],
-        default='dict.txt',
-        help="path to the source dictionary, absolute or relative to DATA_DIR (at training) or MODEL_DIR (at inference)"
+        help="path to the source dictionary, absolute or relative to DATA_DIR (at training) or MODEL_DIR "
+             "(at inference), defaults to 'dict.json' or 'dict.txt'"
     )
     bpe_dropout: float = argument(
         default=0.0,
@@ -588,14 +698,17 @@ class PreprocessingConfig(NoiseConfig):
     )
     stop_sequences: list[str] = argument(
         default=[],
-        help="list of whitespace-delimited token sequences that should stop generation (in addition to '</s>'), not "
-             "supported in beam search"
+        help="non-tokenized sequences that should stop generation (in addition to '</s>'), not supported in beam search"
     )
     strip_prompt: bool = argument(
         default=True,
         help='remove the prompt from the detokenized output'
     )
-
+    protect_tokens: list[str] = argument(
+        default=[],
+        help="list of user tokens to protect from tokenization (in addition to the built-in special tokens, like "
+             "'<s>', '</s>', etc.)"
+    )
 
 class TaskConfig(PreprocessingConfig):
     batch_size: int = argument(
@@ -619,7 +732,7 @@ class TaskConfig(PreprocessingConfig):
     def replace_placeholders(self, path: str) -> str: raise NotImplementedError
 
     def finalize(self):
-        for opt in 'tokenizer_path', 'tokenizer_vocab', 'dict':
+        for opt in 'tokenizer_path', 'dict':
             value = getattr(self, opt, None)
             if value:
                 setattr(self, opt, self.replace_placeholders(value))
@@ -633,14 +746,7 @@ class DecodingAPIConfig(DistributedConfig, DecodingConfig):
     task_cfg: Optional[TaskConfig] = None
     
     task: str = argument(
-        choices=[
-            'translation',
-            'speech_translation',
-            'language_modeling',
-            'doc_level_translation',
-            'nllb_translation',
-            'dialogue',
-        ],
+        choices=lambda: TASKS.keys(),
         default='translation',
     )
     model: str = argument(
@@ -676,7 +782,7 @@ class DecodingAPIConfig(DistributedConfig, DecodingConfig):
         default=False,
         help='load the checkpoint anyway if it has missing or unexpected parameters'
     )
-    model_args: Optional[str] = argument(
+    model_args: Optional[Union[dict, str]] = argument(
         help='json dictionary as a string defining model arguments that should be overloaded'
     )
     encoder_adapters: Optional[list[str]] = argument(
@@ -733,7 +839,7 @@ class DecodingAPIConfig(DistributedConfig, DecodingConfig):
         # these options have higher precedence over 'inference.yaml'
         kwargs = self.parse_dict(kwargs, strict=False)
         cli_opts = self.parse_args(opts, strict=False)
-        task_cfg = get_task_config(self.task)
+        task_cfg = get_task_config_cls(self.task)()
         parse_help(self, task_cfg)
         kwargs = task_cfg.parse_dict(kwargs, strict=False)
         cli_opts = task_cfg.parse_args(cli_opts, strict=strict)  # all command-line options should be accounted for
@@ -752,7 +858,6 @@ class DecodingAPIConfig(DistributedConfig, DecodingConfig):
             self.ckpt = os.path.join(self.model_dir, self.ckpt)
 
         assert os.path.isfile(self.ckpt), f"checkpoint '{self.ckpt}' does not exist"
-        assert self.min_output_len <= self.max_output_len
         assert (self.beam_size == 1 or self.sampling) or not self.task_cfg.stop_sequences, ('beam search does not '
             'support --stop-sequences')
 
@@ -946,22 +1051,8 @@ class DebugTrainingDatasetConfig(SimpleDynamicTrainingDatasetConfig):
     dataloader_prefetch_factor: int = 1
 
 
-MODEL_CONFIGS = {}
-
-def register_model_config(*names: str):
-    assert len(names) >= 1
-    def wrapper(cls):
-        cls.name = names[0]
-        for name in names:
-            MODEL_CONFIGS[name] = cls
-        return cls
-    return wrapper
-
-
 @register_model_config('transformer')
 class TransformerConfig(Config):
-    _arch: str = 'transformer'
-
     encoder_layers: int = argument(
         default=6,
         help='number of Transformer layers in the encoder'
@@ -1179,10 +1270,6 @@ class TransformerConfig(Config):
         help='maximum number of positions in the decoder (can be used for positional embeddings), used to set the '
              'default maximum target length of the data'
     )
-    disable_bos: bool = argument(
-        default=False,
-        help='decoder inputs start directly with the first target token instead of the beginning of sequence token'
-    )
     lora_rank: int = argument(
         default=0,
         help='train LoRA adapters with this bottleneck dimension (the other parameters are frozen)'
@@ -1192,28 +1279,48 @@ class TransformerConfig(Config):
         help='scale the outputs of the low-rank adapters by this amount (hyper-parameter of LoRA)'
     )
 
+    padding_idx: int = argument(
+        default=1,
+        help='token id for padding. Such tokens are ignored by attention and do not contribute to the loss'
+    )
+    bos_idx: int = argument(
+        default=2,
+        help='beginning-of-sequence token used as first decoder input. Can be the same as --eos-idx, or disabled by '
+             'setting to -1'
+    )
+    eos_idx: int = argument(
+        default=2,
+        help='end-of-sequence token id, used as the last source token and as the last target token. Stops generation '
+             'when predicted at inference'
+    )
+    unk_idx: int = argument(
+        default=3,
+        help='token id for out-of-vocabulary tokens, can be the same as --padding-idx'
+    )
+
     def setup_for_inference(self, cfg: DecodingAPIConfig):
         """
         Modify this model configuration according to given decoding configuration: while most model hyper-parameters
         come from the model checkpoint, some may be overriden at decoding
         """
         if cfg.model_args:
-            for name, value in json.loads(cfg.model_args).items():
+            model_args = cfg.model_args
+            if isinstance(model_args, str):
+                model_args = json.loads(model_args)
+            for name, value in model_args.items():
                 setattr(self, name, value)
 
         self.shift_encoder_layers = None
         self.shift_decoder_layers = None
         self.lora_rank = 0  # lora weights are automatically added to the linear weights when loading the checkpoint
         self.set_defaults(cfg.task)
-        assert self.decoder_max_len > cfg.max_output_len, (
+        assert self.decoder_max_len >= cfg.max_output_len, (
             "--max-output-len cannot be higher than the model's max target length"
         )
 
 
 @register_model_config('adapter_transformer')
 class AdapterTransformerConfig(TransformerConfig):
-    _arch: str = 'adapter_transformer'
-
     encoder_adapter_dim: int = argument(
         default=64,
         help='bottleneck dimension of the encoder adapters'
@@ -1262,27 +1369,27 @@ class AdapterTransformerConfig(TransformerConfig):
     )
 
     def setup_for_inference(self, cfg: DecodingAPIConfig):
+        self.encoder_adapter_layer_ids = None
+        self.decoder_adapter_layer_ids = None
         super().setup_for_inference(cfg)
         # Manual adapter definition overriding the model's checkpoint configuration.
         # If several adapters are defined, they will be stacked in the same order.
         # You might want to combine that with --flexible.
-        self.encoder_adapters = cfg.encoder_adapters or []
-        self.decoder_adapters = cfg.decoder_adapters or []
-        if cfg.encoder_adapters is not None or cfg.decoder_adapters is not None:
+        self.encoder_adapters = cfg.encoder_adapters
+        self.decoder_adapters = cfg.decoder_adapters
+        if cfg.encoder_adapters is not None:
             self.encoder_adapters_by = []
+        if cfg.decoder_adapters is not None:
             self.decoder_adapters_by = []
         
         self.adapter_zero_init = True
         # If some adapters are not in the checkpoint and --flexible is set, those will be just bypassed.
         # This enables the user to manipulate checkpoints to define custom adapter configurations that cannot be 
         # defined with options.
-        self.encoder_adapter_layer_ids = None
-        self.decoder_adapter_layer_ids = None
 
 
 @register_model_config('hybrid_transformer')
 class HybridTransformerConfig(TransformerConfig):
-    _arch: str = 'hybrid_transformer'
     decoder_layers: int = 2
 
     decoder_hidden_size: int = argument(
@@ -1297,7 +1404,6 @@ class HybridTransformerConfig(TransformerConfig):
 
 @register_model_config('adapter_hybrid_transformer')
 class AdapterHybridTransformerConfig(AdapterTransformerConfig):
-    _arch: str = 'adapter_hybrid_transformer'
     decoder_layers: int = 2
     
     decoder_hidden_size: int = argument(
@@ -1312,8 +1418,6 @@ class AdapterHybridTransformerConfig(AdapterTransformerConfig):
 
 @register_model_config('moe_transformer')
 class MOETransformerConfig(TransformerConfig):
-    _arch: str = 'moe_transformer'
-
     encoder_expert_count: Union[int, dict] = argument(
         default=4,
         help='number of experts per encoder layer (can also be a dict specifying a different count per layer id)'
@@ -1439,6 +1543,11 @@ class TrainingConfig(DistributedConfig, TrackerConfig, EvalConfig, DecodingConfi
         help='save GPU memory at the cost of slightly slower training by converting the float16 gradients to float32 '
              'only when needed (note that this implies --no-flat-fp16)'
     )
+    optimizer_states_as_fp32: bool = argument(
+        default=True,
+        help='always compute and store the optimizer states in float32, even with `--dtype float16|bfloat16`. This '
+             'takes more GPU memory and disk space but this can give better results'
+    )
     fsdp: bool = argument(
         default=False,
         help='apply the FSDP algorithm (Fully Sharded Data Parallel), i.e., shard the full model & optimizer states '
@@ -1561,17 +1670,11 @@ class TrainingConfig(DistributedConfig, TrackerConfig, EvalConfig, DecodingConfi
              "default behavior of model architectures (e.g., adapter_transformer)"
     )
     task: str = argument(
-        choices=[
-            'translation',
-            'speech_translation',
-            'language_modeling',
-            'doc_level_translation',
-            'dialogue',
-        ],
+        choices=lambda: TASKS.keys(),
         default='translation',
     )
     dataset_type: str = argument(
-        choices=['dynamic', 'simple', 'debug'],
+        choices=lambda: DATASETS.keys(),
         default='dynamic',
         help="type of dataset: 'dynamic' (default) for on-the-fly data loading and preprocessing in a single pipeline; "
              "or 'simple' to avoid using queues and shard the data across N workers per GPU, each doing their own "
@@ -1616,7 +1719,7 @@ class TrainingConfig(DistributedConfig, TrackerConfig, EvalConfig, DecodingConfi
         opts = opts or sys.argv[1:]
         super().__init__(*opts, strict=False, **kwargs)  # to get '--config' and parse the YAML config:
         # we need to read the config file to pick up the values of the '--arch' and '--dataset-type' options,
-        # because they are required by `get_model_config` and `get_dataset_config`
+        # because they are required by `get_model_config_cls` and `get_dataset_config_cls`
 
         self.parse_args(strict=False)  
         yaml_opts = yaml.safe_load(open(self.config)) if self.config else {}
@@ -1628,9 +1731,9 @@ class TrainingConfig(DistributedConfig, TrackerConfig, EvalConfig, DecodingConfi
             self.dataset_type = 'debug'  # other datasets use multiprocessing, which is incompatible with breakpoints
             self.verbose = True
 
-        dataset_cfg = get_dataset_config(self.dataset_type)
-        model_cfg = get_model_config(self.arch)
-        task_cfg = get_task_config(self.task)
+        dataset_cfg = get_dataset_config_cls(self.dataset_type)()
+        model_cfg = get_model_config_cls(self.arch)()
+        task_cfg = get_task_config_cls(self.task)()
 
         parse_help(self, task_cfg, dataset_cfg, model_cfg)
 
@@ -1651,7 +1754,7 @@ class TrainingConfig(DistributedConfig, TrackerConfig, EvalConfig, DecodingConfi
         self.task_cfg = task_cfg
 
         # set default options that depend on the task
-        for cfg in self, self.dataset_cfg, self.model_cfg:
+        for cfg in self, self.dataset_cfg, self.model_cfg, self.task_cfg:
             cfg.set_defaults(self.task)
 
         self.finalize()
@@ -1701,15 +1804,9 @@ class TrainingConfig(DistributedConfig, TrackerConfig, EvalConfig, DecodingConfi
         if self.sequence_parallel and self.tp_size > 1:  # with sequence parallelism, only the master rank reads 
             # batches, then it shards them and scatters them to the other ranks. But for the sharding to work, the
             # batch size (in terms of sequences per batch) should be a multiple of the number of GPUs: which requires
-            # --batch-size-multiple to be correctly set, and --batch-size (the maximum number of tokens in a batch) to
-            # be large enough
+            # --batch-size-multiple to be correctly set
             if self.task_cfg.batch_size_multiple is None:
                 self.task_cfg.batch_size_multiple = self.tp_size
-            else:
-                assert self.task_cfg.batch_size_multiple % self.tp_size == 0, 'tensor parallelism with ' \
-                    '--sequence-parallel requires --batch-size-multiple to be a multiple of --tp-size'
-            assert self.task_cfg.batch_size >= (max_len * self.task_cfg.batch_size_multiple), 'batch size is too ' \
-                'small for --sequence-parallel (it should be a least max sequence length * batch size multiple)'
 
         if self.only_validate:
             self.max_steps = 0
@@ -1848,7 +1945,6 @@ class TranslationTaskConfig(TaskConfig):
         help='prefix every target sentence with these special tokens (note that different tags can be specified per '
              'corpus in the YAML configuration)'
     )
-    # TODO: Allow placeholders for maximum flexibility: {domain} {lang} {target_lang} {source_lang}
     source_lang_code: bool = argument(
         default=False,
         help="prefix source lines with the source language code (e.g., '<lang:de>')"
@@ -1878,12 +1974,6 @@ class TranslationTaskConfig(TaskConfig):
     )
     target_tokenizer_path: Optional[str] = argument(
         help='path to the BPE model used to tokenize target lines (default: same as --tokenizer-path)'
-    )
-    target_tokenizer_vocab: Optional[str] = argument(
-        help='path to the target BPE vocabulary used for frequency-based filtering (default: same as --tokenizer-vocab)'
-    )
-    target_vocabulary_threshold: Optional[int] = argument(
-        help='minimum frequency of generated subwords on the target side (default: same as --vocabulary-threshold)'
     )
     target_spell_out: float = argument(
         default=0.0,
@@ -1962,7 +2052,7 @@ class TranslationTaskConfig(TaskConfig):
         elif self.target_langs and len(self.target_langs) == 1:
             self.target_lang = self.target_langs[0]
         
-        for opt in 'target_tokenizer_path', 'target_tokenizer_vocab', 'target_dict':
+        for opt in 'target_tokenizer_path', 'target_dict':
             value = getattr(self, opt, None)
             if value:
                 setattr(self, opt, self.replace_placeholders(value))
@@ -2015,10 +2105,6 @@ class DocumentLevelTranslationTaskConfig(TranslationTaskConfig):
         default='<sep>',
         help="use this special token as a separator between sentences in a document (it has to be in the dictionary)"
     )
-    trailing_sent_sep: bool = argument(
-        default=False,
-        help='also add a sentence separator after the last sentence of a document'
-    )
 
 
 class LanguageModelingTaskConfig(TaskConfig):
@@ -2036,7 +2122,6 @@ class LanguageModelingTaskConfig(TaskConfig):
         help='maximum tokens per line. Longer lines will be truncated (validation data) or skipped (training data). '
              'Default: same as --decoder-max-len'
     )
-
     # Tagging
     tags: Optional[list[str]] = argument(
         help='prefix every sentence with these tokens (note that different tags can be specified per corpus in the '
@@ -2074,9 +2159,11 @@ class LanguageModelingTaskConfig(TaskConfig):
 
 
 class DialogueTaskConfig(LanguageModelingTaskConfig):
-    custom_chat_template: Optional[str] = argument(help="custom chat template specified in the HuggingFace format")
-    chat_template: Optional[str] = argument(help="chat template to use (e.g., 'chatml')")
+    chat_template: Optional[str] = argument(help="chat template to use (e.g., 'zephyr')")
     system_prompt: Optional[str] = argument(help='message to use as system prompt, if the chat template supports it')
+    retriever_config: Optional[dict] = argument(
+        help='retriever configuration for the playground (url, collection id, prompt templates, etc.)'
+    )
 
 
 class NLLBTranslationTaskConfig(TranslationTaskConfig):
@@ -2090,48 +2177,6 @@ class NLLBTranslationTaskConfig(TranslationTaskConfig):
         help='directory containing the expert checkpoints (whose names are specified with --expert-ckpt or '
              '--expert-json)'
     )
-
-
-def get_dataset_config(name: str = 'dynamic', strict: bool = True) -> TrainingDatasetConfig:
-    # maps dataset type names (as specified by --dataset-type) to dataset configs 
-    configs = {
-        'dynamic': DynamicTrainingDatasetConfig,
-        'simple': SimpleDynamicTrainingDatasetConfig,
-        'debug': DebugTrainingDatasetConfig,
-    }
-    if name not in configs:
-        if strict:
-            raise ValueError(f'unknown dataset type: {name}')
-    return configs.get(name, DynamicTrainingDatasetConfig)()
-
-
-def get_task_config_cls(name: str = 'translation', strict: bool = True) -> type[TaskConfig]:
-    # maps task names (as specified by --task) to task config classes
-    configs = {
-        'translation': TranslationTaskConfig,
-        'speech_translation': TranslationTaskConfig,
-        'language_modeling': LanguageModelingTaskConfig,
-        'doc_level_translation': DocumentLevelTranslationTaskConfig,
-        'nllb_translation': NLLBTranslationTaskConfig,
-        'dialogue': DialogueTaskConfig,
-    }
-    if name not in configs:
-        if strict:
-            raise ValueError(f'unknown task: {name}')
-    return configs.get(name, TranslationTaskConfig)
-
-
-def get_task_config(name: str = 'translation', strict: bool = True) -> TaskConfig:
-    cls = get_task_config_cls(name, strict=strict)
-    return cls()
-
-
-def get_model_config(arch: str = 'transformer', strict: bool = True) -> TransformerConfig:
-    if arch not in MODEL_CONFIGS:
-        if strict:
-            raise ValueError(f'unknown architecture: {arch}')
-    config_cls = MODEL_CONFIGS[arch]
-    return config_cls()
 
 
 @register_model_config('transformer_big', 'transformer_wmt_en_de_big', 'transformer_vaswani_wmt_en_de_big')
@@ -2211,7 +2256,7 @@ class Bloom560MConfig(TransformerConfig):
     scale_embed: bool = False
     decoder_embed_norm: bool = True
     activation_fn: str = 'gelu_tanh'
-    disable_bos: bool = True
+    bos_idx: int = -1  # disabled
 
 @register_model_config('bloom_1b1')
 class Bloom1B1Config(Bloom560MConfig):
@@ -2252,6 +2297,10 @@ class Llama7BConfig(TransformerConfig):
     activation_fn: str = 'swiglu'
     rms_norm: bool = True
     has_bias: bool = False
+    padding_idx: int = 0
+    bos_idx: int = 1
+    eos_idx: int = 2
+    unk_idx: int = 0
 
 @register_model_config('llama_13b')  # Llama v1 or v2
 class Llama13BConfig(Llama7BConfig):
@@ -2260,6 +2309,12 @@ class Llama13BConfig(Llama7BConfig):
     decoder_ffn_dim: int = 13824
     decoder_attention_heads: int = 40
 
+@register_model_config('qwen_14b')  # or CausalLM-14B
+class Qwen14BConfig(Llama13BConfig):
+    decoder_ffn_dim: int = 13696
+    decoder_max_len: int = 8192
+    norm_eps: float = 1e-06
+
 @register_model_config('llama_34b')  # Llama v2
 class Llama34BConfig(Llama7BConfig):
     decoder_layers: int = 48
@@ -2267,6 +2322,20 @@ class Llama34BConfig(Llama7BConfig):
     decoder_ffn_dim: int = 22016
     decoder_attention_heads: int = 64
     attention_heads_kv: int = 8
+
+@register_model_config('yi_34b')
+class Yi34BConfig(Llama7BConfig):
+    decoder_layers: int = 60
+    embed_dim: int = 7168
+    decoder_ffn_dim: int = 20480
+    decoder_attention_heads: int = 56
+    attention_heads_kv: int = 8
+    decoder_max_len: int = 4096
+    rope_base: int = 5000000
+
+@register_model_config('yi_34b_200k')
+class Yi34BConfig(Yi34BConfig):
+    decoder_max_len: int = 200000
 
 @register_model_config('llama_70b')  # Llama v2
 class Llama70BConfig(Llama7BConfig):
@@ -2302,6 +2371,15 @@ class Llama3BConfig(Llama7BConfig):
     decoder_max_len: int = 2048
     norm_eps: float = 1e-06
 
+@register_model_config('llama_1b')  # TinyLlama-1.1B
+class Llama1BConfig(Llama7BConfig):
+    decoder_layers: int = 22
+    embed_dim: int = 2048
+    decoder_ffn_dim: int = 5632
+    decoder_attention_heads: int = 32
+    decoder_max_len: int = 2048
+    norm_eps: float = 1e-05
+    attention_heads_kv: int = 4
 
 @register_model_config('mistral_7b')
 class Mistral7BConfig(Llama7BConfig):
@@ -2309,6 +2387,13 @@ class Mistral7BConfig(Llama7BConfig):
     decoder_ffn_dim: int = 14336
     sliding_window: int = 4096
     decoder_max_len: int = 32768
+
+@register_model_config('mixtral_7b')
+class Mixtral7BConfig(MOETransformerConfig, Mistral7BConfig):
+    decoder_expert_count: int = 8
+    rope_base: int = 1000000
+    moe_impl: str = 'basic'
+    sliding_window = None
 
 
 @register_model_config('mpt_7b')
@@ -2325,7 +2410,10 @@ class MPT7BConfig(TransformerConfig):
     activation_fn: str = 'gelu'
     has_bias: bool = False
     norm_bias: bool = False
-    disable_bos: bool = True
+    bos_idx: int = 0
+    eos_idx: int = 0
+    padding_idx: int = 1
+    unk_idx: int = 1
 
 @register_model_config('mpt_7b_65k')
 class MPT7B65kConfig(MPT7BConfig):
@@ -2357,6 +2445,10 @@ class Falcon7BConfig(TransformerConfig):
     has_bias: bool = False
     shared_norm: bool = True
     parallel_attention: bool = True
+    bos_idx: int = 11
+    eos_idx: int = 11
+    padding_idx: int = 9  # arbitrary, since the Falcon config doesn't define a padding token
+    unk_idx: int = padding_idx
 
 @register_model_config('falcon_40b')
 class Falcon40BConfig(Falcon7BConfig):
@@ -2469,6 +2561,9 @@ class WhisperConfig(TransformerConfig):
     encoder_max_len: int = 3000
     decoder_max_len: int = 448
     attention_key_bias: bool = False
+    padding_idx: int = 50256
+    eos_idx: int = 50257
+    bos_idx: int = 50258
 
 @register_model_config('whisper_large')
 class WhisperLargeConfig(WhisperConfig):
@@ -2504,6 +2599,10 @@ class T5BaseConfig(TransformerConfig):
     scale_embed: bool = False
     scale_attn: bool = False
     check_inf: bool = True
+    bos_idx: int = -1  # disabled
+    eos_idx: int = 1
+    padding_idx: int = 0
+    unk_idx: int = 0
 
 @register_model_config('t5_large')
 class T5LargeConfig(T5BaseConfig):

@@ -4,6 +4,7 @@
 import os
 from typing import Optional, Union
 import regex
+import json
 import itertools
 import collections
 import logging
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 import copy
 from typing import Optional, Sequence, Iterable, Iterator
+from pasero.tokenizers import sep, bos, eos, unk, pad
 from pasero.tokenizers import PaseroTokenizer, SentencePieceTokenizer, HuggingFaceTokenizer, CharacterTokenizer, load_vocab
 from pasero.tokenizers.noise import mask, noisify
 from pasero import utils
@@ -24,12 +26,11 @@ BPEModel = Union[HuggingFaceTokenizer, PaseroTokenizer, SentencePieceTokenizer, 
 logger = logging.getLogger('preprocessing')
 
 
-sep, bos, pad, eos, unk = '<sep>', '<s>', '<pad>', '</s>', '<unk>'
 copy_tag = '<PHL>'
 
 
 def mask_padding(ids: Sequence[int], eos_idx: int, padding_idx: int) -> list[int]:
-    """ Return a mask with ones at padding token positions or after the EOS """
+    """ Return a mask with ones at padding token positions """
     mask = []
     for token_id in ids:
         if token_id == padding_idx:
@@ -80,53 +81,84 @@ class Dictionary:
 
     Note that if they are not specified, `<s>` and `<unk>` are given respectively the same value as `</s>` and `<pad>`.
     And if it is not there, `<pad>` is automatically given the id -1.
+
+    A dictionary can also be created directly from a HuggingFace-style JSON vocabulary (which maps tokens to their id).
+    This is done automatically by calling `build(...)` with a file path ending in '.json'
     """
 
-    def __init__(self, path: str, size: Optional[int] = None):
+    tokens: list[str]        # maps ids to strs
+    indices: dict[str, int]  # maps strs to ids
+
+    @classmethod
+    def build(cls, path: str, size: Optional[int] = None):
         """
         Args:
             path: path to the dict file (text file with one token and its frequency per line, delimited by a
-                whitespace)
+                whitespace) or to a json vocabulary
             size: pad the dictionary to this size
         """
-        self.tokens = list(load_vocab(path))
-        token_set = set(self.tokens)
-        
-        if eos not in token_set:  # the dict does not contain special tokens (fairseq-style)
-            for token in sep, bos, pad, eos, unk:
-                assert token not in token_set, (
-                    "dictionary has a partial set of special tokens: it should either have none of them "
-                    "(fairseq-style), or all of them (custom-style). "
-                    "A custom dictionary should contain at least '</s>', and a fairseq dictionary is not allowed to "
-                    "contain '</s>', '<s>', '<unk>', '<pad>' or '<sep>'"
-                )
-            # automatically add special tokens
-            self.tokens = [sep, pad, eos, unk] + self.tokens  # <s> is not used in fairseq checkpoints, so we use this
-            # position for something else
+        if path.endswith('.json'):
+            with open(path) as dict_file:
+                indices = json.load(dict_file)  # same format as HuggingFace's tokenizer.vocab
+                return cls(indices, size=size)
+        else:
+            tokens = load_vocab(path)
+            return cls(tokens, size=size)
 
-        self.tokens = self.tokens[:size]
-        i = 0
-        while size is not None and size > len(self.tokens):
-            w = f'madeupword{i:04}'
-            if w not in token_set:
-                self.tokens.append(w)
-            i += 1
-        self.indices = {w: i for i, w in enumerate(self.tokens)}
+    def __init__(self, vocab: Union[list, dict], size: Optional[int] = None):
+        """
+        Initialize a Dictionary either from a list of tokens (fairseq-style) or from a dictionary that directly maps
+        each token to its id (HuggingFace-style).
+        """
+        assert not isinstance(vocab, str), 'to initialize a dictionary from a path, call Dictionary.build(...)'
 
-        # at the very minimum eos_idx and padding_idx have to be defined
-        self.eos_idx = self.indices[eos]
-        self.padding_idx = self.indices.get(pad, -1)
+        if isinstance(vocab, dict):
+            self.indices = dict(vocab)
+            vocab_size = max(self.indices.values()) + 1
+            self.tokens = [unk] * vocab_size
+            for w, i in self.indices.items():
+                self.tokens[i] = w
+        else:
+            self.tokens = list(vocab)
+            token_set = set(self.tokens)
+            
+            if eos not in token_set:  # the dict does not contain special tokens (fairseq-style)
+                for token in sep, bos, pad, eos, unk:
+                    assert token not in token_set, (
+                        "dictionary has a partial set of special tokens: it should either have none of them "
+                        "(fairseq-style), or all of them (custom-style). "
+                        "A custom dictionary should contain at least '</s>', and a fairseq dictionary is not allowed to "
+                        "contain '</s>', '<s>', '<unk>', '<pad>' or '<sep>'"
+                    )
+                # automatically add special tokens
+                self.tokens = [sep, pad, eos, unk] + self.tokens  # <s> is not used in fairseq checkpoints, so we use
+                # this position for something else
+
+            self.indices = {w: i for i, w in enumerate(self.tokens)}
+
+        assert all(token in self.indices for token in self.tokens)
+        assert len(self.tokens) == max(self.indices.values()) + 1
+        if size is not None:
+            self.extend(size)
+
+        assert all(token_id >= 0 for token_id in self.indices.values()), 'negative token ids are not allowed'
+        # These special token ids may be ignored, because `Task.setup_for_model()` modifies their values to match those
+        # of the model.
+        self.eos_idx = self.indices.get(eos)
+        self.padding_idx = self.indices.get(pad, self.indices.get(unk))
         self.bos_idx = self.indices.get(bos, self.eos_idx)      # if not defined, bos_idx = eos_idx
         self.unk_idx = self.indices.get(unk, self.padding_idx)  # if not defined, unk_idx = padding_idx
         self.sep_idx = self.indices.get(sep, self.bos_idx)
-        
-        self.special_tokens = utils.SpecialTokens(
-            padding_idx=self.padding_idx,
-            eos_idx=self.eos_idx,
-            bos_idx=self.bos_idx,
-            unk_idx=self.unk_idx,
-            sep_idx=self.sep_idx,
-        )
+
+    def extend(self, size: int) -> None:
+        """ Extend this dictionary to given size by padding with dummy tokens """
+        i = 0
+        while size > len(self.tokens):
+            w = f'madeupword{i:04}'
+            if w not in self.indices:
+                self.indices[w] = len(self.tokens)
+                self.tokens.append(w)
+            i += 1
 
     def __len__(self):
         return len(self.tokens)
@@ -135,7 +167,24 @@ class Dictionary:
         return token in self.indices
 
     def __getitem__(self, idx: int) -> str:
-        return self.tokens[idx]
+        # self.tokens may not accurately reflect special tokens. For instance, it's important that 
+        # eos_idx -> eos, even if eos and bos share the same id.
+        if idx == self.eos_idx:
+            return eos
+        elif idx == self.padding_idx:
+            return pad
+        elif idx == self.bos_idx:
+            return bos
+        elif idx == self.sep_idx:
+            return sep
+        elif idx == self.unk_idx:
+            return unk
+        else:
+            return self.tokens[idx]
+
+    def __setitem__(self, idx: int, token: str):
+        self.tokens[idx] = token
+        self.indices[token] = idx
 
     def __eq__(self, other) -> bool:
         return isinstance(other, Dictionary) and other.tokens == self.tokens
@@ -145,13 +194,12 @@ class Dictionary:
 
     def to_indices(
         self,
-        line: str,
+        tokens: list[str],
         max_len: Optional[int] = None,
         append_eos: bool = True,
         prepend_bos: bool = False,
         truncate_left: bool = False,
     ) -> np.ndarray:
-        tokens = line.split(' ') if line else []
         ids = [self.idx(token) for token in tokens]
         
         if max_len is not None:
@@ -163,10 +211,8 @@ class Dictionary:
             ids.append(self.eos_idx)
         return np.array(ids, dtype=np.int64)
 
-    def to_string(self, ids: Sequence[int], keep_padding: bool = False) -> str:
-        mask = mask_padding(ids, eos_idx=self.eos_idx, padding_idx=self.padding_idx)
-        tokens = [self[token_id] for token_id, is_padding in zip(ids, mask) if keep_padding or not is_padding]
-        return ' '.join(tokens)
+    def to_string(self, ids: Sequence[int]) -> list[str]:
+        return [self[token_id] for token_id in ids if token_id != self.padding_idx]
 
     def remap_embed(self, old_embed: torch.Tensor, old_dict, default: Optional[str] = None) -> torch.Tensor:
         default_idx = old_dict.indices[default] if default else None
@@ -177,7 +223,7 @@ class Dictionary:
             if token in old_dict.indices:
                 old_index = old_dict.indices[token]
                 v = old_embed[old_index]
-            elif default is None:
+            elif not default:
                 v = torch.empty_like(old_embed[0])
                 utils.embed_init(v)
                 unk_count += 1
@@ -193,8 +239,9 @@ class Dictionary:
 _LANG_CODE_PREFIX = 'lang:'
 _DOMAIN_TAG_PREFIX = 'domain:'
 
-_LANG_CODE_REGEX = regex.compile(f'<{regex.escape(_LANG_CODE_PREFIX)}([^>]+)>')
-_DOMAIN_TAG_REGEX = regex.compile(f'<{regex.escape(_DOMAIN_TAG_PREFIX)}([^>]+)>')
+_LANG_CODE_REGEX = regex.compile(f'<{regex.escape(_LANG_CODE_PREFIX)}(.+?)>')
+_DOMAIN_TAG_REGEX = regex.compile(f'<{regex.escape(_DOMAIN_TAG_PREFIX)}(.+?)>')
+
 
 def is_lang_code(token: str) -> bool:
     return bool(_LANG_CODE_REGEX.fullmatch(token))
@@ -238,6 +285,13 @@ class TextPreprocessor:
         dir: str,
         **kwargs,
     ):
+        """
+        Args:
+            - cfg: configuration of this preprocessor
+            - dir: directory where to look for tokenizer files (typically equals to `--data-dir` at training and 
+                `--model-dir` at inference)
+            - kwargs: override the parameters in `cfg` by these keyword arguments
+        """
         self.training = False
         self.dir = dir
 
@@ -256,24 +310,65 @@ class TextPreprocessor:
             assert self.cfg.tokenizer == 'pasero', '--spell-out and --bpe-dropout are only compatible with ' \
                 '--tokenizer pasero'
 
-        # Parameters in `cfg` can be overloaded with keyword arguments
+        # Parameters in `cfg` can be overriden with keyword arguments
         for k, v in kwargs.items():
             setattr(self.cfg, k, v)
 
         self.dict_path = self.tokenizer_path = self.vocab_path = None
 
-        self.load_dict()
+        self.load_tokenizer()
         assert not cfg.masking or mask in self.dictionary, f'{mask} is OOV'
 
-        special_tokens = self.dictionary.special_tokens
-        self.padding_idx = special_tokens.padding_idx
-        self.eos_idx = special_tokens.eos_idx
-        self.unk_idx = special_tokens.unk_idx
-        self.bos_idx = special_tokens.bos_idx
-        self.special_tokens = special_tokens
+        # special tokens that will be protected from tokenization. Note that lang and domain tags are not included: 
+        # they are handled by split_tags, and only when they are at the beginning of the sequence
+        protected_tokens = [sep, bos, eos, unk] + cfg.protect_tokens
+        protected_tokens_regex = '|'.join(regex.escape(token) for token in protected_tokens)
+        self.protected_tokens_regex = regex.compile(protected_tokens_regex)
+        # split both according to special tokens and stop sequences (we don't want the tokenization of stop sequences 
+        # to be conflated with the surrounding characters)
+        split_tokens = protected_tokens + cfg.stop_sequences
+        split_tokens_regex = '|'.join(regex.escape(token) for token in split_tokens)
+        split_tokens_regex = f'({split_tokens_regex})'  # add capturing group for regex.split()
+        self.split_tokens_regex = regex.compile(split_tokens_regex)
+        # note that lang and domain tags
+        self.set_stop_sequences(cfg.stop_sequences)
 
-        self.load_tokenizer()  # TODO: allow per-language BPE vocabularies
+    @property
+    def bos_idx(self) -> int:
+        return self.dictionary.bos_idx
     
+    @bos_idx.setter
+    def bos_idx(self, value: int):
+        self.dictionary.bos_idx = value
+        self.dictionary[value] = bos
+    
+    @property
+    def eos_idx(self) -> int:
+        return self.dictionary.eos_idx
+    
+    @eos_idx.setter
+    def eos_idx(self, value: int):
+        self.dictionary.eos_idx = value
+        self.dictionary[value] = eos
+    
+    @property
+    def padding_idx(self) -> int:
+        return self.dictionary.padding_idx
+    
+    @padding_idx.setter
+    def padding_idx(self, value: int):
+        self.dictionary.padding_idx = value
+        self.dictionary[value] = pad
+    
+    @property
+    def unk_idx(self) -> int:
+        return self.dictionary.unk_idx
+    
+    @unk_idx.setter
+    def unk_idx(self, value: int):
+        self.dictionary.unk_idx = value
+        self.dictionary[value] = unk
+
     @classmethod
     def default_tokenizer_path(cls, tokenizer: str) -> str:
         if tokenizer == 'sentencepiece':
@@ -310,15 +405,6 @@ class TextPreprocessor:
     def num_symbols(self) -> int:
         return len(self.dictionary)
 
-    def _find_file(self, path: str):
-        """ Looks for a file whose path is either absolute or relative to `self.dir` """
-        return utils.find_file(path, dirs=[self.dir, '.'])
-
-    def load_dict(self):
-        self.dict_path = self._find_file(self.cfg.dict)
-        self.dictionary = Dictionary(self.dict_path)
-        logger.info(f'{self.dictionary.__class__.__name__}: {len(self.dictionary)} symbols')
-
     @property
     def files(self):
         """
@@ -327,41 +413,59 @@ class TextPreprocessor:
         return {self.tokenizer_path, self.dict_path} - {None}
 
     def load_tokenizer(self) -> Optional[BPEModel]:
-        if self.cfg.tokenizer == 'none':
-            self._tokenizer = None
-            return
-        elif self.cfg.tokenizer == 'char':
-            self._tokenizer = CharacterTokenizer()
-            return
-        elif self.cfg.tokenizer == 'hf':
-            # `tokenizer` should be the name of a HuggingFace tokenizer (not a file path)
-            self._tokenizer = HuggingFaceTokenizer(
-                self.cfg.tokenizer_path or self.dir,
-                add_prefix_space=self.cfg.hf_add_prefix_space,
-            )
-            # self.tokenizer_path = None for HF tokenizers, since they don't correspond to a single file, but rather
-            # a full model directory or HuggingFace repo
-            return
+        requires_dict = self.cfg.tokenizer in ('none', 'char', 'pasero')  # some tokenizers may have a built-in
+        # dictionary (SentencePiece and HuggingFace), while others need a separate dict file
 
-        self.tokenizer_path = self._find_file(self.cfg.tokenizer_path)
-
-        if self.cfg.tokenizer_vocab and self.cfg.vocabulary_threshold != -1:
-            self.vocab_path = self._find_file(self.cfg.tokenizer_vocab)
-            # intersection of provided vocab and Pasero dictionary
-            vocab = load_vocab(self.vocab_path, self.cfg.vocabulary_threshold)
-            vocab = [k for k in vocab if k in self.dictionary]
-        else:  # we don't want the BPE model to generate OOV subwords
-            vocab = self.dictionary
-
-        if self.cfg.tokenizer == 'pasero':
-            self._tokenizer = PaseroTokenizer.read(self.tokenizer_path, vocab=vocab, inline_case=self.cfg.inline_case)
+        # Attempt to load a dictionary, from given "--dict" option or by looking for "dict.json" or "dict.txt" files
+        # If such a dictionary is found, it will override the tokenizer's built-in dictionary (if any).
+        # In the case of SentencePiece and Pasero, this dictionary will also be used for BPE filtering (i.e., the models
+        # won't be allowed to generate subwords that are out of vocabulary).
+        # Note that if a "dict.json" or "dict.txt" file exists, it will be loaded by default (even if "--dict" is not 
+        # set). To avoid loading it (e.g., if one such file exists but it does not match our tokenizer),
+        # "--dict" can be set to a dummy value (e.g., "--dict none")
+        if self.cfg.dict:
+            self.dict_path = utils.find_file(self.cfg.dict, dirs=[self.dir, '.'], fail=requires_dict)  # --dict can be 
+            # relative to data/model dir or to the working directory
         else:
-            self._tokenizer = SentencePieceTokenizer(self.tokenizer_path, vocab, inline_case=self.cfg.inline_case)
-        
-        desc = f'{self._tokenizer.__class__.__name__}: {len(self._tokenizer)} merge operations'
-        if self._tokenizer.vocab:
-            desc += f', vocab size {len(self._tokenizer.vocab)}'
-        logger.info(desc)
+            self.dict_path = utils.find_file('dict.json', 'dict.txt', dirs=[self.dir], fail=requires_dict)
+
+        if self.dict_path is None:
+            self.dictionary = None
+        else:
+            self.dictionary = Dictionary.build(self.dict_path)
+            logger.info(f'{self.dictionary.__class__.__name__}: {len(self.dictionary)} symbols')
+
+        if self.cfg.tokenizer == 'none':
+            self.tokenizer_path = None
+            self._tokenizer = None
+        elif self.cfg.tokenizer == 'char':
+            self.tokenizer_path = None
+            self._tokenizer = CharacterTokenizer()
+        elif self.cfg.tokenizer == 'hf':
+            self.tokenizer_path = None
+            # `tokenizer_path` should be the name of a HuggingFace tokenizer (not a file path). If it is not specified,
+            # assume the data/model dir is a valid HuggingFace space
+            self._tokenizer = HuggingFaceTokenizer(self.cfg.tokenizer_path or self.dir)
+            if self.dictionary is None:  # build the dictionary from this tokenizer's built-in vocab
+                self.dictionary = Dictionary(self._tokenizer.vocab)
+        elif self.cfg.tokenizer == 'pasero':
+            self.tokenizer_path = utils.find_file(self.cfg.tokenizer_path, dirs=[self.dir, '.'])
+            self._tokenizer = PaseroTokenizer(
+                self.tokenizer_path, self.dictionary, inline_case=self.cfg.inline_case
+            )
+            logger.info(f'{self._tokenizer.__class__.__name__}: {len(self._tokenizer)} merge operations')
+        elif self.cfg.tokenizer == 'sentencepiece':
+            self.tokenizer_path = utils.find_file(self.cfg.tokenizer_path, dirs=[self.dir, '.'])
+            self._tokenizer = SentencePieceTokenizer(
+                self.tokenizer_path, self.dictionary, inline_case=self.cfg.inline_case
+            )
+            if self.dictionary is None:  # build the dictionary from this tokenizer's built-in vocab
+                self.dictionary = Dictionary(self._tokenizer.vocab)
+            logger.info(f'{self._tokenizer.__class__.__name__}: {len(self._tokenizer)} merge operations')
+        else:
+            raise ValueError(f"Unknown tokenizer type: '{self.cfg.tokenizer}'")
+
+        assert self.dictionary is not None
 
     @property
     def inference_options(self) -> dict:
@@ -382,11 +486,7 @@ class TextPreprocessor:
             if name not in noise_options and value != default:
                 options[name] = value
 
-        paths = {
-            'tokenizer_path': self.tokenizer_path,
-            'dict': self.dict_path,
-            'tokenizer_vocab': self.vocab_path,
-        }
+        paths = {'tokenizer_path': self.tokenizer_path, 'dict': self.dict_path}
 
         for name, value in paths.items():
             options.pop(name, None)  # paths given in training config may have changed (they can be relative to the 
@@ -401,22 +501,22 @@ class TextPreprocessor:
 
         return options
 
-    def get_oov(self, line: str) -> tuple[collections.Counter, set]:
-        counts = collections.Counter(token for token in line.split(' '))
+    def get_oov(self, tokens: list[str]) -> tuple[collections.Counter, set]:
+        counts = collections.Counter(token for token in tokens)
         oov = {w for w in counts if w not in self.dictionary}
         return counts, oov
 
     def binarize(
         self,
-        line: str,
+        tokens: list[str],
         max_len: Optional[int] = None,
         append_eos: bool = True,
         prepend_bos: bool = False,
         as_tensor: bool = False,
         truncate_left: bool = False,
-    ) -> Optional[Union[np.ndarray, torch.LongTensor]]:
+    ) -> Union[np.ndarray, torch.LongTensor]:
         ids = self.dictionary.to_indices(
-            line,
+            tokens,
             max_len=max_len,
             append_eos=append_eos,
             prepend_bos=prepend_bos,
@@ -449,7 +549,7 @@ class TextPreprocessor:
         line = line.replace(copy_tag, '')
         return ' '.join(line.split(' '))
 
-    def tokenize(self, line: str) -> Optional[str]:
+    def tokenize(self, line: str) -> list[str]:
         if not self.cfg.keep_whitespaces:
             line = remove_non_printing_char(line)
             line = ' '.join(line.split())  # the line above may result in consecutive whitespaces
@@ -460,54 +560,66 @@ class TextPreprocessor:
         if self.training:
             line = noisify(line, **vars(self.cfg))
 
-        if line and self.cfg.tokenizer != 'none':
+        if not line or self.cfg.tokenizer == 'none':
+            return line.split()
+        elif self.cfg.tokenizer != 'none':
             dropout = self.cfg.bpe_dropout if self.training else 0.0
             spell_out = self.cfg.spell_out if self.training else 0.0
-            line = self._tokenizer.tokenize(line, dropout=dropout, spell_out=spell_out)
-
-        return line
+            tokens = []
+            for split in self.split_tokens_regex.split(line):
+                if not split:
+                    continue
+                elif self.protected_tokens_regex.fullmatch(split):
+                    tokens.append(split)
+                else:
+                    # FIXME: this will add a prefix whitespace after each special token, is this ok?
+                    # For example: "Hello </s>World!" -> ['▁Hello', '▁', '</s>', '▁World']
+                    tokens += self._tokenizer.tokenize(split, dropout=dropout, spell_out=spell_out)
+            return tokens
     
-    def debinarize(self, ids: Sequence[int], keep_padding: bool = False) -> str:
+    def debinarize(self, ids: Sequence[int]) -> list[str]:
         """
         Transform a sequence of dictionary ids into a sequence of tokens.
 
         ```
         debinarize([109, 4, 23911, 4122, 35, 87, 61, 4676, 491, 2839, 2292])
-        # "▁les <T> ▁chauss ettes ▁de ▁l ' arch id uch esse"
+        # ['▁les', '<T>', '▁chauss', 'ettes', '▁de', '▁l', '\'', 'arch', 'id', 'uch', 'esse']"
         ```
         """
-        return self.dictionary.to_string(ids, keep_padding=keep_padding)
+        return self.dictionary.to_string(ids)
 
-    def detokenize(self, line: str) -> str:
+    def detokenize(self, tokens: list[str]) -> str:
         """
         Transform a sequence of (whitespace-delimited) tokens into a sequence of words.
 
         ```
-        detokenize("▁les <T> ▁chauss ettes ▁de ▁l ' arch id uch esse")
+        detokenize(['▁les', '<T>', '▁chauss', 'ettes', '▁de', '▁l', '\'', 'arch', 'id', 'uch', 'esse'])
         # "Les chaussettes de l'archiduchesse"
         ```
         """
-        line = self.remove_special_tokens(line)  # remove <unk> and </s>
+        tokens = self.remove_special_tokens(tokens)  # remove <unk> and </s>
 
         if self._tokenizer is not None:
-            line = self._tokenizer.detokenize(line)
+            line = self._tokenizer.detokenize(tokens)
+        else:
+            line = ' '.join(tokens)
         
         if not self.cfg.keep_whitespaces:
             line = line.rstrip()  # remove trailing line breaks and whitespaces
 
         return line
 
-    @property
-    def stop_sequences(self) -> list[torch.LongTensor]:
+    def set_stop_sequences(self, stop_sequences: list[str]) -> None:
         """
-        Convert the --stop-sequences option (list of tokenized text sequences) into sequences of ids that can be 
+        Convert the --stop-sequences option (list of tokenized text sequences) into a sequence of ids that can be 
         understood by the model or the decoding algorithms.
         """
-        stop_sequences = [
-            self.binarize(stop_seq, append_eos=False, as_tensor=True)
-            for stop_seq in self.cfg.stop_sequences
+        self.raw_stop_sequences = stop_sequences
+        self.tok_stop_sequences = [self.tokenize(stop_seq) for stop_seq in self.raw_stop_sequences]
+        self.bin_stop_sequences = [
+            self.binarize(tokens, append_eos=False, as_tensor=True)
+            for tokens in self.tok_stop_sequences
         ]
-        return [stop_seq for stop_seq in stop_sequences if len(stop_seq) > 0]
     
     @property
     def blacklist(self) -> list[int]:
@@ -517,17 +629,22 @@ class TextPreprocessor:
         """
         return [self.dictionary.idx(token) for token in self.cfg.blacklist]
 
-    def remove_special_tokens(self, line: str) -> str:
-        special_tokens = {unk, eos}
-        tokens = []
-        for token in line.split():
-            if token not in special_tokens:
-                tokens.append(token)
-        line = ' '.join(tokens)
+    def is_special_token(self, token: str) -> bool:
+        return (
+            token in (unk, eos) or
+            any(len(stop_seq) == 1 and token == stop_seq[0] for stop_seq in self.tok_stop_sequences)  # strip stop
+            # sequences that contain a single token
+        )
+
+    def remove_special_tokens(self, tokens: list[str]) -> list[str]:
+        tokens = [token for token in tokens if not self.is_special_token(token)]
         # decoding stops *after* generating the stop sequences, so we need to strip them from the output
-        for stop_seq in self.cfg.stop_sequences:
-            line = line.removesuffix(stop_seq).rstrip(' ')
-        return line
+        for stop_seq in self.tok_stop_sequences:
+            if stop_seq and len(stop_seq) > 1:  # stop sequences of length 1 were already stripped above
+                if tokens[-len(stop_seq):] == stop_seq:
+                    tokens = tokens[:-len(stop_seq)]
+                    break
+        return tokens
 
     def detokenize_on_the_fly(self, tokens: Iterable[str]) -> Iterator[tuple[str, list[str]]]:
         """ 
@@ -549,6 +666,5 @@ class TextPreprocessor:
         " l'archiduchesse" ['▁l', "'", 'arch', 'id', 'uch', 'esse']
         """
         yield from self._tokenizer.detokenize_on_the_fly(
-            self.remove_special_tokens(tok)
-            for tok in tokens
+            token for token in tokens if not self.is_special_token(token)
         )

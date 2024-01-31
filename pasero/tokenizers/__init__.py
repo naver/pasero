@@ -1,19 +1,25 @@
 # Pasero Copyright (c) 2023-present NAVER Corporation
 # Please refer to the license file provided in the project.
 
-import os
-import sys
 import regex
 import unicodedata
-from collections import defaultdict
 from typing import Optional, Iterable, Iterator
 from .noise import mask
 from .pasero_tokenizer import inline_case_to_cased, PaseroTokenizer, detokenize
 from .pasero_tokenizer import _NO_MIXED_CASE_REGEX, _TITLE_CODE, _UPPER_CODE, _LOWER_CODE, _CASE_SYMBOLS
 
 
+sep, bos, pad, eos, unk = '<sep>', '<s>', '<pad>', '</s>', '<unk>'
+
 
 def load_vocab(path: str, threshold: Optional[int] = None) -> list[str]:
+    """
+    Loads a vocabulary in the Pasero/fairseq format: one token per line, with an optional frequency.
+    Returns the ordered list of tokens. This is typically used to initialize `Dictionary`, by using the token's 
+    position in the list as token id (after prepending special tokens).
+    Note that this is different from `HuggingFaceTokenizer.vocab` which directly returns a dict mapping each 
+    token to its id.
+    """
     with open(path, newline='\n') as vocab_file:
         vocab = []
         for line in vocab_file:
@@ -24,74 +30,22 @@ def load_vocab(path: str, threshold: Optional[int] = None) -> list[str]:
         return vocab
 
 
-def build_dict(vocab, dict_path=None, dict_custom_symbols=[], dict_placeholders=0, dict_padding_offset=4,
-               dict_padding_factor=8, dict_min_freq=10, dict_max_size=None, **_):
-    dictionary = dict.fromkeys(['<T>', '<U>', '<BT>', '<PHL>', mask], 0)
-    
-    if not isinstance(vocab, dict):  # vocab can be a list or set
-        vocab = dict.fromkeys(vocab, 0)
-
-    vocab = dict(vocab)    # convert Counter to dict (because Counter's update has a different behavior)
-    # count all characters and add missing characters to the dictionary
-    chars = defaultdict(int)
-    for word, count in vocab.items():
-        if word not in dictionary:   # do not spell out special tokens
-            for char in word:
-                chars[char] += count
-    vocab.update(chars)   # unexpected behavior with Counter
-    vocab = {w: c for w, c in vocab.items() if not c or c >= dict_min_freq}
-    vocab = sorted(vocab.items(), key=lambda p: (-p[1], p[0]))  # sort by count, then alphabetically
-    dictionary.update(dict(vocab))
-    
-    special_symbols = []
-    for token in sorted(dict_custom_symbols):
-        if token not in dictionary:
-            special_symbols.append((token, 0))
-
-    i = 0
-    for _ in range(dict_placeholders):
-        special_symbols.append((f'madeupword{i:04}', 0))
-        i += 1
-
-    dictionary = list(dictionary.items())
-
-    if dict_max_size is not None:
-        assert len(special_symbols) < dict_max_size
-        dictionary = dictionary[:dict_max_size - len(special_symbols)]
-    
-    dictionary += special_symbols
-
-    while (len(dictionary) + dict_padding_offset) % dict_padding_factor != 0:
-        dictionary.append((f'madeupword{i:04}', 0))
-        i += 1
-
-    if dict_path is not None:
-        if dict_path == '-':
-            dict_file = sys.stdout
-        else:
-            dirname = os.path.dirname(dict_path)
-            if dirname:
-                os.makedirs(dirname, exist_ok=True)
-            dict_file = open(dict_path, 'w')
-        dict_file.writelines(f'{token} {count}\n' for token, count in dictionary)
-    return dictionary
-
-
 class SentencePieceTokenizer(object):
-    def __init__(self, sentencepiece_model, vocab=None, inline_case=False):
-        self.sentencepiece_model = sentencepiece_model
-        self.vocab = vocab
+    def __init__(self, path: str, vocab: Optional[list[str]] = None, inline_case: bool = False):
+        self.path = path
         self.inline_case = inline_case
         import sentencepiece as spm
-        self.sp = spm.SentencePieceProcessor(model_file=sentencepiece_model)
-        
+        self._tokenizer = spm.SentencePieceProcessor(model_file=path)
         if vocab:
-            self.sp.SetVocabulary(list(vocab))
+            self._tokenizer.SetVocabulary(list(vocab))
+            self._vocab = vocab
+        else:
+            self._vocab = [self._tokenizer.IdToPiece(i) for i in range(self._tokenizer.vocab_size())]
 
     def __getstate__(self):
         return {
-            'sentencepiece_model': self.sentencepiece_model,
-            'vocab': self.vocab,
+            'path': self.path,
+            'vocab': self._vocab,
             'inline_case': self.inline_case,
         }
 
@@ -102,7 +56,7 @@ class SentencePieceTokenizer(object):
         self.__init__(**state)
 
     def __len__(self):
-        return len(self.sp)
+        return len(self._tokenizer)
 
     @staticmethod
     def _clean(line):
@@ -110,35 +64,35 @@ class SentencePieceTokenizer(object):
 
     def _get_case(self, s):
         if s.istitle():
-            return _TITLE_CODE
+            return '<T>'
         if s.isupper():
-            return _UPPER_CODE
+            return '<U>'
         elif s.islower() or s.lower() == s:
             return _LOWER_CODE
         else:
             return None
 
-    def _tokenize(self, x):
+    def _tokenize(self, x: str) -> list[str]:
         pieces = []
-        for piece in self.sp.EncodeAsPieces(x):
-            if self.sp.IsUnknown(self.sp.PieceToId(piece)):
+        for piece in self._tokenizer.EncodeAsPieces(x):
+            if self._tokenizer.IsUnknown(self._tokenizer.PieceToId(piece)):
                 pieces += list(piece)
             else:
                 pieces.append(piece)
-        return ' '.join(pieces)
+        return pieces
 
-    def tokenize(self, x, **_):
+    def tokenize(self, x: str, **_) -> list[str]:
         if not self.inline_case:
             return self._tokenize(x)
 
         orig = self._clean(unicodedata.normalize('NFKC', x))
         orig_lower = ' '.join(y if len(x) == len(y) else x for x, y in ((w, w.lower()) for w in orig.split()))
         # only lowercase words whose length is not modified by lowercasing
-        line = self._clean(self._tokenize(orig_lower))
+        wordpieces = self._tokenize(orig_lower)
 
         output = []
         j = 0
-        for wordpiece in line.split():
+        for wordpiece in wordpieces:
             if wordpiece == '▁':
                 output.append(wordpiece)
                 continue
@@ -167,13 +121,12 @@ class SentencePieceTokenizer(object):
             else:
                 output += [prefix + wordpiece, _CASE_SYMBOLS[case]]
 
-        return ' '.join(w for w in output if w is not None)
+        return [w for w in output if w is not None]
 
-    def detokenize(self, line):
-        tokens = line.split(' ')
+    def detokenize(self, tokens: list[str]) -> str:
         if '<T>' in tokens or '<U>' in tokens:
             tokens = inline_case_to_cased(tokens)
-        line = self.sp.decode(tokens)
+        line = self._tokenizer.decode(tokens)
 
         # The Llama tokenizer uses hexadecimal codes to encode some special symbols (e.g., line break, tabulation, etc.)
         # Those should be converted automatically by 'decode', but this doesn't work when setting a vocabulary
@@ -196,7 +149,7 @@ class SentencePieceTokenizer(object):
     def detokenize_on_the_fly(self, tokens: Iterable[str]) -> Iterator[tuple[str, list[str]]]:
         def detok(tokens: list[str]) -> str:
             prefix = ' ' if tokens[0][0] == '▁' else ''
-            return prefix + self.detokenize(' '.join(tokens))
+            return prefix + self.detokenize(tokens)
         
         prev_tokens = []
         for token in tokens:
@@ -209,60 +162,69 @@ class SentencePieceTokenizer(object):
         if prev_tokens:
             yield detok(prev_tokens), prev_tokens
 
+    @property
+    def vocab(self) -> list[int]:
+        return self._vocab
+
 
 class HuggingFaceTokenizer(object):
-    def __init__(self, huggingface_model: str, add_prefix_space: bool = False):
-        # FIXME: should add_prefix_space=True be the default behavior? It seems the BLOOM models where not trained
-        # this way (https://github.com/huggingface/transformers/blob/main/src/transformers/models/bloom/tokenization_bloom_fast.py#L68)
+    def __init__(self, path: str):
         from transformers import AutoTokenizer
-        self.add_prefix_space = add_prefix_space
-        self.model = AutoTokenizer.from_pretrained(huggingface_model)
-        self.vocab = None
+        self._tokenizer = AutoTokenizer.from_pretrained(path)
+        # TODO: should we set legacy=False? https://github.com/huggingface/transformers/pull/24565
+        vocab = dict(self._tokenizer.vocab)
+        # Remap special tokens that may have a different name according to this tokenizer
+        eos_token = self._tokenizer.eos_token
+        if eos_token is not None:
+            vocab[eos] = vocab[eos_token]
+        bos_token = self._tokenizer.bos_token
+        if bos_token is not None:
+            vocab[bos] = vocab[bos_token]
+        pad_token = self._tokenizer.pad_token
+        if pad_token is not None and pad_token != eos_token:
+            vocab[pad] = vocab[pad_token]
+        self._vocab = vocab
 
     def __len__(self) -> int:
-        return len(self.model)
+        return len(self._tokenizer)
 
-    def tokenize(self, x: str, **_) -> str:
-        if self.add_prefix_space:
-            x = f' {x}'
-        tokens = self.model.tokenize(x)
-        tokens = [token.replace(' ', 'Ġ') for token in tokens]  # the whitespace ' ' has a special meaning in 
-        # Pasero, it is used as a delimiter betwen tokens. Make sure that the subwords do not contain whitespaces.
-        # FIXME: this trick works with the BLOOM and MPT tokenizers but may fail with other tokenizers
-        return ' '.join(tokens)
+    def tokenize(self, x: str, **_) -> list[str]:
+        tokens = self._tokenizer.tokenize(x)
+        return tokens
 
-    def detokenize(self, x: str) -> str:
-        x = self.model.convert_tokens_to_string(x.split(' '))
-        if self.add_prefix_space:
-            x = x.removeprefix(' ')
-        return x
+    def detokenize(self, tokens: list[str]) -> str:
+        return self._tokenizer.convert_tokens_to_string(tokens)
 
     def detokenize_on_the_fly(self, tokens: Iterable[str]) -> Iterator[tuple[str, list[str]]]:
         all_tokens = ['.']  # start with non empty prefix to disable SentencePiece's annoying behavior with prefix 
         # whitespace:
         # ["▁Hello", "▁world"] -> "Hello world" (no whitespace before "Hello", because it is the first token)
         # [".", "▁Hello", "▁world"] -> ". Hello world" (whitespace before "Hello", because it isn't the first token)
-        prev_detok = self.model.convert_tokens_to_string(all_tokens)  # this dummy prefix will be stripped
+        prev_detok = self._tokenizer.convert_tokens_to_string(all_tokens)  # this dummy prefix will be stripped
         
         for token in tokens:
             all_tokens.append(token)
-            detok = self.model.convert_tokens_to_string(all_tokens).rstrip('�')
+            detok = self._tokenizer.convert_tokens_to_string(all_tokens).rstrip('�')
             word = detok[len(prev_detok):]
             yield word, [token]
             prev_detok = detok
 
+    @property
+    def vocab(self) -> dict[str, int]:
+        return self._vocab
+
 
 class CharacterTokenizer(object):
     def __init__(self):
-        self.vocab = self.model = None
+        self._vocab = self._tokenizer = None
 
     def __len__(self) -> int:
         return 0
 
-    def tokenize(self, x: str, **_) -> str:
+    def tokenize(self, x: str, **_) -> list[str]:
         x = ' '.join(x.split()).replace(' ', '▁')
-        return ' '.join(x)
+        return list(x)
 
-    def detokenize(self, x: str) -> str:
-        x = x.replace('▁', ' ')
+    def detokenize(self, tokens: list[str]) -> str:
+        x = ''.join(tokens).replace('▁', ' ')
         return ' '.join(x.split())

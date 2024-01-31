@@ -14,7 +14,7 @@ from pasero.tasks import Task
 from pasero.models.transformer import Transformer, Decoder
 from pasero.models.adapters import AdapterTransformer
 from pasero.utils import defined
-from pasero.config import AdapterHybridTransformerConfig, DistributedConfig, HybridTransformerConfig
+from pasero.config import register_model, AdapterHybridTransformerConfig, DistributedConfig, HybridTransformerConfig
 
 
 logger = logging.getLogger('models')
@@ -58,6 +58,7 @@ class AttentionLayer(nn.Module):
         return attn, scores
 
 
+@register_model('hybrid_transformer')
 class HybridTransformer(Transformer):
     """
     Hybrid model with a Transformer encoder and LSTM decoder like in our "Efficient Inference for Multilingual NMT" 
@@ -70,6 +71,7 @@ class HybridTransformer(Transformer):
         return LSTMDecoder(self.cfg, self.dist_cfg, self.task, embed=embed)
 
 
+@register_model('adapter_hybrid_transformer')
 class AdapterHybridTransformer(AdapterTransformer):
     def build_decoder(self, embed: Optional[Embedding] = None) -> 'LSTMDecoder':
         return LSTMDecoder(self.cfg, self.dist_cfg, self.task, embed=embed)

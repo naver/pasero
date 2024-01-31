@@ -147,9 +147,11 @@ class HuggingFaceModel:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             truncation_side='left',
+            padding_side='left',
+            trust_remote_code=True,
         )
         if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token = self.tokenizer.bos_token
         self.is_chat_model = self.tokenizer.chat_template is not None
         
         system_prompt = 'You are a helpful, respectful and honest AI assistant.'
@@ -172,7 +174,7 @@ class HuggingFaceModel:
     def input_to_conversation(self, input: str) -> list[dict]:
         pattern = r'(\nUser:|\nAssistant:)'
         if not re.search(pattern, '\n' + input):
-            input = f'User: {input}'  # for interactive use with pasero-decode
+            input = f'User: {input}'
         raw_conversation = re.split(pattern, '\n' + input)
         
         role = 'system'
@@ -204,7 +206,7 @@ class HuggingFaceModel:
                     conversation,
                     tokenize=False,
                     add_generation_prompt=True,
-                )
+                )  # FIXME: catch exception "Conversation roles must alternate"
                 if suffix is not None:
                     input += suffix
                 inputs_new.append(input)
@@ -216,6 +218,7 @@ class HuggingFaceModel:
             padding=True,
             truncation=True,  # TODO: smarter truncation that keeps the system message and correct format
             max_length=self.max_len - 10,
+            add_special_tokens=not self.is_chat_model,  # should be covered by the chat template
         ).to(self.model.device)
         input_tok.pop('token_type_ids', None)  # incompatible with LLaMA
         return input_tok
@@ -258,9 +261,11 @@ class HuggingFaceModel:
             thread = Thread(target=self.model.generate, kwargs=kwargs)
             thread.start()
 
+            strip_whitespace = False
             if self.is_chat_model:
                 if input.rfind('\nUser:') >= input.rfind('\nAssistant:'):
                     yield {'detok': '\nAssistant: '}
+                    strip_whitespace = True
 
             text = ''
             tokens = []
@@ -277,6 +282,11 @@ class HuggingFaceModel:
                     yield {'prompt_tokens': tokens, 'elapsed': elapsed}
                     tokens = []
                 else:
+                    if strip_whitespace:  # some models start their assistant answers by a whitespace prefix, this is 
+                        # redundant with the whitespace we add after the "Assistant:" prompt.
+                        word = word.lstrip()
+                        strip_whitespace = (not word)  # continue stripping whitespaces as long as we don't generate
+                        # something else
                     text += word
                     yield {'tokens': tokens, 'detok': word, 'elapsed': elapsed}
                     if stop_regex and re.search(stop_regex, text):
@@ -324,7 +334,7 @@ class HuggingFaceModel:
         if self.is_chat_model:
             for i, input in enumerate(inputs):
                 if input.rfind('\nUser:') >= input.rfind('\nAssistant:'):
-                    detok[i] = '\nAssistant: ' + {detok[i]}
+                    detok[i] = '\nAssistant: ' + detok[i]
         return detok
 
 
@@ -366,6 +376,11 @@ def get_data():
     data = data.to_dict()
     data.pop('input[]', None)
     data.pop('input', None)
+    
+    for key in list(data):
+        if key.startswith('retriever_'):  # not supported for now with the HF backend
+            data.pop(key)
+
     if input:
         data['input'] = input
 
@@ -419,7 +434,7 @@ def api(name: str):
     if name not in models:
         return Response(status=204)
     
-    model_info: dict = models[name].model_info
+    model_info: dict = dict(models[name].model_info)
     decoding_opts = model_info.get('decoding_options', {})
     decoding_opts_repr = {repr(k): repr(v) for k, v in decoding_opts.items()}
     model_info['decoding_options'] = decoding_opts_repr  # for pretty printing

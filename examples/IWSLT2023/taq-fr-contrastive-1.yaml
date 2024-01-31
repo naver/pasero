@@ -34,6 +34,8 @@ virtual_dp_size: 8
 max_steps: 300000
 encoder_max_len: 2048
 decoder_max_len: 128
+memory_efficient_fp16: False  # for some reason --memory-efficient-fp16 explodes with this config
+flat_fp16: True
 
 # min_len_ratio: 3
 # max_len_ratio: 40
@@ -53,7 +55,6 @@ target_lang_code: True
 lang_temperature: 3
 buffer_size: 8000
 dataset_type: dynamic
-dataloader_workers: 1
 normalize_punctuation: True  # for NLLB
 
 train_corpora:

@@ -8,7 +8,9 @@ Please refer to the license file provided in the project.
 <head>
   <title>Pasero Playground</title>
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/themes/prism.min.css" rel="stylesheet" />
+  <script src="https://code.jquery.com/ui/1.13.2/jquery-ui.js"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/themes/prism.min.css" rel="stylesheet">
+  <link href="https://code.jquery.com/ui/1.13.2/themes/base/jquery-ui.css" rel="stylesheet">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/prism.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-python.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.21.0/components/prism-bash.min.js"></script>
@@ -26,14 +28,33 @@ Please refer to the license file provided in the project.
     var ongoing = false;
     var source = null;
     var elapsed = 0;
+    var retriever_auto_template = '';
+    var retriever_output_template = '';
+    var retriever_query_template = '';
+    var default_retriever_id = 'none';
+    var retriever_query = null;
+    var retrieved_docs = null;
 
     $(function () {
+      $('.hidden').each(function() {
+        $(this).hide();
+      });
 
+      $("#token_dialog").dialog({
+        autoOpen: false,
+        width: 600,
+        height: 600,
+        position: { 
+          my: "left center", 
+          at: "right+20 center", 
+          of: "#playground"
+        }
+      });
       function set_langs(el, langs, default_lang) {
         if (!langs || langs.length <= 1) {
-          el.parent().hide();
           return;
         }
+        el.parent().show();
 
         for (const lang_code of langs) {
           el.append(new Option(languages[lang_code], lang_code));
@@ -44,36 +65,22 @@ Please refer to the license file provided in the project.
           el.val(default_lang);
         }
       }
-      
-      $.ajax({
-        type: "POST",
-        url: '/' + model_name + '/info',
-        success: function(data)
-        {
-          model_info = data;
-          decoding_options = model_info.decoding_options || {};
-        
-          // Set default decoding options based on the values specified in model_info.decoding_options
-          // Avoid using Jinja templates for better portability of this JS code
-          $('#header').text(model_info.name + ' (' + model_info.task.replaceAll('_', ' ') + ')')
-          $("#api").click(_ => { location.href = '/' + model_info.name + '/api' });
-          $('[name=max_output_len]').val(decoding_options.max_output_len || 512);
-          $('[name=repeat_penalty]').val(decoding_options.repeat_penalty || 1.0);
-          $('[name=sampling_temperature]').val(decoding_options.sampling_temperature || 1.0);
-          $('[name=sampling_topp]').val(decoding_options.sampling_topp || 0.92);
-          $('[name=stop_regex]').val(decoding_options.stop_regex);
-          if (decoding_options.sampling) {
-            $('#sampling').prop('checked', true);
-          }
-          if (model_info.prompt) {
-            $('#input').text(model_info.prompt);
-            updateFormatting();
-          }
 
-          set_langs($('#source_lang'), model_info.source_langs, decoding_options.source_lang);
-          set_langs($('#target_lang'), model_info.target_langs, decoding_options.target_lang);
+      function setSampling() {
+        $('#sampling_topp').parent().show();
+        $('#sampling_temperature').parent().show();
+      }
+      function setGreedy() {
+        $('#sampling_topp').parent().hide();
+        $('#sampling_temperature').parent().hide();
+      }
+      function updateOptions() {
+        if ($('#sampling').prop('checked')) {
+          setSampling();
+        } else {
+          setGreedy();
         }
-      });
+      }
 
       function getData() {
         var data = {};
@@ -81,6 +88,16 @@ Please refer to the license file provided in the project.
           data[item.name] = item.value;
         });
         data.input = getInput();
+        data.retriever_auto_template = retriever_auto_template;
+        data.retriever_output_template = retriever_output_template;
+        data.retriever_query_template = retriever_query_template;
+        data.sampling = $('#sampling').prop('checked');
+        if (!$('#auto_retrieve').prop('checked')) {
+          data.retriever_auto_template = '';  // the retriever will always retrieve if the template is empty
+        }
+        if (!$('#generate_queries').prop('checked')) {
+          data.retriever_query_template = '';  // the retriever will use the user message as query if the template is empty
+        }
         return data;
       }
 
@@ -95,7 +112,7 @@ Please refer to the license file provided in the project.
       }
 
       function htmlToText(html) {
-        // html = html.replaceAll('<pre>', '```').replaceAll('</pre>', '```');
+        html = html.replace(/<b>(Document \d+):<\/b> <a href="(.*)">(.*)<\/a>/g, '$1: $3 ($2)');
         html = html.replace(/<pre><code class="language-([a-zA-Z]+)">([\s\S]*?)<\/code><\/pre>/g, function(match, language, text) {
             return '```' + language + '\n' + text + '```';
         });
@@ -105,14 +122,14 @@ Please refer to the license file provided in the project.
 
         // TODO: add ids to such blocks to avoid confusion with generated HTML
         html = html.replaceAll('<code>', '`').replaceAll('</code>', '`');
-        // html = html.replaceAll('<strong>', '**').replaceAll('</strong>', '**');
-        // html = html.replaceAll('<em>', '*').replaceAll('</em>', '*');
-
         return $("<div>").html(html).text();
       }
 
       function getInput() {
-        return htmlToText($('#input').html());
+        var input = htmlToText($('#input').html());
+        // strip retriever outputs
+        input = input.replace(/Document \d+:.*\n/g, '');
+        return input;
       }
 
       function writeOutput(text, clear = false) {
@@ -140,13 +157,13 @@ Please refer to the license file provided in the project.
           content = $('<div>').text(content).html();
 
           // Set 'User:' and 'Assistant:' to bold
-          content = content.replace(/(User:|Assistant:)/g, '<b>$1</b>');
-
+          content = content.replace(/(Document \d+): (.*) \((.*?)\)/g, '$1: <a href="$3">$2</a>');
+          content = content.replace(/(User:|Assistant:|Retriever query:|Document \d+:)/g, '<b>$1</b>');
           content = content.replace(/```([a-zA-Z]+)?\n\s*([\s\S]*?)```/g, function(match, language, code) {
               code = $('<div>').html(code).text();
               if (language) {
                 var highlightedCode = Prism.highlight(code, Prism.languages[language], language);
-                return '<pre><code class="language-' + language + '">' + highlightedCode + '</code></pre>';
+                return `<pre><code class="language-${language}">${highlightedCode}</code></pre>`;
               } else {
                 return '<pre><code>' + code + '</code></pre>';
               }
@@ -164,9 +181,70 @@ Please refer to the license file provided in the project.
         placeCaretAtEnd(el[0]);
       }
 
+      $.ajax({
+        type: "POST",
+        url: '/' + model_name + '/retrievers',
+        success: function(data)
+        {
+          console.debug('Retrievers:', data);
+          if (data.length > 0) {
+            $('[name=retriever_id]').parent().show();
+            $('[name=retriever_topk]').parent().show();
+            $('#auto_retrieve').parent().show();
+            $('#generate_queries').parent().show();
+          }
+
+          for (const retriever of data) {
+            var retriever_id = retriever['collection'] + '/' + retriever['model']
+            $('[name=retriever_id]').append(new Option(retriever['description'], retriever_id));
+          }
+          $('[name=retriever_id]').val(default_retriever_id);
+        }
+      });
+
+      $.ajax({
+        type: "POST",
+        url: '/' + model_name + '/info',
+        success: function(data)
+        {
+          model_info = data;
+          decoding_options = model_info.decoding_options || {};
+        
+          // Set default decoding options based on the values specified in model_info.decoding_options
+          // Avoid using Jinja templates for better portability of this JS code
+          $('#header').text(model_info.name + ' (' + model_info.task.replaceAll('_', ' ') + ')')
+          $("#api").click(_ => { location.href = '/' + model_info.name + '/api' });
+          $('[name=max_output_len]').val(decoding_options.max_output_len || 512);
+          $('[name=repeat_penalty]').val(decoding_options.repeat_penalty || 1.0);
+          $('[name=sampling_temperature]').val(decoding_options.sampling_temperature || 1.0);
+          $('[name=sampling_topp]').val(decoding_options.sampling_topp || 0.92);
+          $('[name=stop_regex]').val(decoding_options.stop_regex);
+          if (decoding_options.sampling) {
+            $('#sampling').prop('checked', true);
+          }
+          if (model_info.prompt) {
+            $('#input').text(model_info.prompt);
+            updateFormatting();
+          }
+
+          set_langs($('#source_lang'), model_info.source_langs, decoding_options.source_lang);
+          set_langs($('#target_lang'), model_info.target_langs, decoding_options.target_lang);
+          updateOptions();
+
+          if (model_info.retriever_config) {
+            var config = model_info.retriever_config;
+            retriever_auto_template = config.auto_template || '';
+            retriever_output_template = config.output_template || '';
+            retriever_query_template = config.query_template || '';
+            default_retriever_id = config.id;
+            $('[name=retriever_id]').val(default_retriever_id);
+            $('[name=retriever_topk]').val(config.topk);
+          }
+        }
+      });
+
       function generate() {
         var data = getData();
-        data.sampling = $('#sampling').prop('checked');
         if (ongoing) {
           console.debug('busy...');
           return;
@@ -183,7 +261,6 @@ Please refer to the license file provided in the project.
         var url = model_info.name + "/stream?" + params.toString();
         source = new EventSource(url);
 
-
         source.onmessage = function (event) {
           var el = $('#input')[0];
           var isAtBottom = el.scrollHeight - el.scrollTop <= el.clientHeight + 5;
@@ -192,6 +269,24 @@ Please refer to the license file provided in the project.
 
           if ('prompt_tokens' in res) {
             prompt_tokens = res.prompt_tokens;
+            $('#prompt_tokens').text(prompt_tokens.join(' '));
+          }
+
+          if ('retrieved_docs' in res) {
+            retriever_query = res['retriever_query'];
+            retrieved_docs = res['retrieved_docs'];
+            let input = '\n' + data['input'];
+            if (input.lastIndexOf('\nRetriever query:') <= input.lastIndexOf('\nUser:')) {
+              // do not write the retriever query if it was given through the playground
+              writeOutput(`\nRetriever query: ${retriever_query}`);
+            }
+            for (const [index, doc] of retrieved_docs.entries()) {
+              let title = doc['title'];
+              let url = doc['url'];
+              let rank = index + 1;
+              let desc = `\nDocument ${rank}: ${title} (${url})`;
+              writeOutput(desc);
+            }
           }
 
           if ('elapsed' in res && 'tokens' in res && tokens.length > 0) {
@@ -201,7 +296,7 @@ Please refer to the license file provided in the project.
             var txt = (1000 * elapsed).toFixed(0) + ' ms';
             if (gen_length > 0) {
               var wps = (gen_length / elapsed).toFixed(1);
-              txt += ' (' + wps + ' tokens/s)';
+              txt += ` (${wps} tokens/s)`;
             }
             $('#elapsed').text(txt);
           }
@@ -215,6 +310,7 @@ Please refer to the license file provided in the project.
             var max_token_count = model_info.max_len;
             var token_count = prompt_tokens.length + tokens.length;
             $('#token_count').text(token_count + '/' + max_token_count);
+            $('#gen_tokens').text(tokens.join(' '));
           }
 
           if ('detok' in res) {
@@ -255,36 +351,41 @@ Please refer to the license file provided in the project.
           generate();
         }
       });
-      
       $('#fancy').change(function(e) {
         updateFormatting();
       });
-
-      function setSampling() {
-        $('#sampling_topp').prop('disabled', false);
-        $('#sampling_temperature').prop('disabled', false);
-      }
-      function setGreedy() {
-        $('#sampling_topp').prop('disabled', true);
-        $('#sampling_temperature').prop('disabled', true);
-      }
-      function updateOptions() {
-        if ($('#sampling').prop('checked')) {
-          setSampling();
-        } else {
-          setGreedy();
-        }
-      }
-
-      updateOptions()
-
       $('#sampling').change(function(e) {
         updateOptions();
       });
 
-      $('#toggleFields').click(function() {
-        $('#fields').toggle();  // hides/shows the fields div
+      $('#toggle_options').click(function() {
+        $('#options').toggle();  // hides/shows the options div
         $(this).toggleClass('toggled');
+
+        // $(this).
+        "https://icons.getbootstrap.com/assets/icons/caret-up-fill.svg"
+      });
+
+      $("#retriever_auto_template").click(function(event) {
+        retriever_auto_template = prompt(
+          event.target.title,
+          retriever_auto_template.replaceAll('\n', '\\n'),
+        ).replaceAll('\\n', '\n');
+      });
+      $("#retriever_query_template").click(function(event) {
+        retriever_query_template = prompt(
+          event.target.title,
+          retriever_query_template.replaceAll('\n', '\\n'),
+        ).replaceAll('\\n', '\n');
+      });
+      $("#retriever_output_template").click(function(event) {
+        retriever_output_template = prompt(
+          event.target.title,
+          retriever_output_template.replaceAll('\n', '\\n'),
+        ).replaceAll('\\n', '\n');
+      });
+      $('#show_tokens').click(function() {
+        $("#token_dialog").dialog("open");
       });
     });
   </script>
@@ -338,7 +439,7 @@ Please refer to the license file provided in the project.
       flex-grow: 1;
     }
 
-    button {
+    .button {
       background-color: #007BFF;
       color: white;
       padding: 10px 20px;
@@ -348,28 +449,18 @@ Please refer to the license file provided in the project.
       margin: auto;
     }
 
-    button:hover {
+    .button:hover {
       background-color: #0056b3;
     }
 
-    button:disabled {
+    .button:disabled {
       background-color: #B0C7D4;
       color: #ffffff;
       cursor: not-allowed;
       opacity: 0.9;
     }
 
-    button:disabled:hover {
-      background-color: #B0C7D4;
-    }
-
-    button.toggled {
-      background-color: #B0C7D4;
-      color: #ffffff;
-      opacity: 0.9;
-    }
-
-    button.toggled:hover {
+    .button:disabled:hover {
       background-color: #B0C7D4;
     }
 
@@ -392,6 +483,30 @@ Please refer to the license file provided in the project.
       display: inline-block;
       margin-bottom: 20px;
     }
+
+    .edit {
+      cursor: pointer;
+      vertical-align: -2px;
+      content: url("https://icons.getbootstrap.com/assets/icons/pencil-square.svg");
+    }
+
+    #gen_tokens {
+      margin-top: 30px;
+    }
+
+    #toggle_options {
+      padding: 0;
+      height: 22px;
+      width:100%;
+      background: #333 url("https://icons.getbootstrap.com/assets/icons/caret-up-fill.svg") no-repeat center;
+      filter: invert(1);
+    }
+    #toggle_options.toggled {
+      background: #333 url("https://icons.getbootstrap.com/assets/icons/caret-down-fill.svg") no-repeat center;
+    }
+    #toggle_options:hover, #toggle_options.toggled:hover {
+      background-color: #555;
+    }
   </style>
 </head>
 
@@ -399,12 +514,12 @@ Please refer to the license file provided in the project.
   <form id="playground">
     <div class="field" id="header">
     </div>
-    <div id="fields">
-      <div class="field">
+    <div id="options">
+      <div class="field hidden">
         <label for="source_lang">Source language:</label>
         <select id="source_lang" name="source_lang"></select>
       </div>
-      <div class="field">
+      <div class="field hidden">
         <label for="target_lang">Target language:</label>
         <select id="target_lang" name="target_lang"></select>
       </div>
@@ -432,6 +547,24 @@ Please refer to the license file provided in the project.
         <label>Stop regex:</label>
         <input type="text" name="stop_regex">
       </div>
+      <div class="field hidden">
+        <label for="retriever_id">Retriever:</label>
+        <select name="retriever_id">
+          <option value="none">None</option>
+        </select>
+      </div>
+      <div class="field hidden">
+        <label>Retriever top-k <img class="edit" id="retriever_output_template" title="Edit the retriever output template">:</label>
+        <input type="number" name="retriever_topk" min="0" max="10" value="0">
+      </div>
+      <div class="field hidden">
+        <label>Generate queries <img class="edit" id="retriever_query_template" title="Edit the query generation template">:</label>
+        <input type="checkbox" id="generate_queries" checked>
+      </div>  
+      <div class="field hidden">
+        <label>Decide when to retrieve <img class="edit" id="retriever_auto_template" title="Edit the template for deciding when to retrieve">:</label>
+        <input type="checkbox" id="auto_retrieve" checked>
+      </div>
       <div class="field">
         <label>Fancy formatting:</label>
         <input type="checkbox" id="fancy" checked>
@@ -442,17 +575,25 @@ Please refer to the license file provided in the project.
       Elapsed: <span id="elapsed"></span>
     </div>
     <div class="field">
-      Tokens: <span id="token_count"></span>
+      <label>Tokens <img class="edit" id="show_tokens" title="Show the tokenization">:</label>
+      <span id="token_count"></span>
+    </div>
+
+    <div class="field">
+      <button class="button" type="button" id="toggle_options"></button>
     </div>
 
     <div id="input" name="input" contenteditable="true" spellcheck="false"></div>
 
     <div class="field">
-      <button id="chat">Chat</button>
-      <button id="stop">Stop</button>
-      <button type="button" id="toggleFields">Options</button>
-      <button type="button" id="api">API</button>
+      <button class="button" id="chat">Chat</button>
+      <button class="button" id="stop">Stop</button>
+      <button class="button" type="button" id="api">API</button>
     </div>
   </form>
 </body>
+<div id="token_dialog" title="Tokens">
+  <div id="prompt_tokens"></div>
+  <div id="gen_tokens"></div>
+</div>
 </html>

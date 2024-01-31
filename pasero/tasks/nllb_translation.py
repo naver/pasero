@@ -6,12 +6,13 @@ import itertools
 import re
 from torch import nn
 from typing import Optional
-from pasero.config import NLLBTranslationTaskConfig, TransformerConfig
+from pasero.config import register_task, NLLBTranslationTaskConfig, TransformerConfig
 from pasero.tasks import TranslationTask
 
 logger = logging.getLogger('nllb_translation')
 
 
+@register_task('nllb_translation')
 class NLLBTranslationTask(TranslationTask):
     cfg: NLLBTranslationTaskConfig
 
@@ -22,6 +23,8 @@ class NLLBTranslationTask(TranslationTask):
         self.prev_expert_ckpt = None
         self.gate_state_dict = None
         self.rank = self.world_size = None
+        self.default_source_lang = self.default_source_lang or 'eng_Latn'
+        self.default_target_lang = self.default_source_lang or 'fra_Latn'
     
     @staticmethod
     def expert_id_to_ckpt(expert_id: int) -> str:
@@ -64,7 +67,8 @@ class NLLBTranslationTask(TranslationTask):
 
     def load_checkpoint_for_inference(
         self,
-        *ckpt_paths: str,
+        main_ckpt_path: str,
+        *other_ckpt_paths: str,
         rank: int = 0,
         world_size: int = 1,
         arch: Optional[str] = None,
@@ -74,7 +78,8 @@ class NLLBTranslationTask(TranslationTask):
             arch = 'moe_transformer'
 
         model_state, model_cfg = super().load_checkpoint_for_inference(
-            *ckpt_paths,
+            main_ckpt_path,
+            *other_ckpt_paths,
             rank=0,
             world_size=1,  # disable other types of sharding (TP or Tutel) since NLLB-200 has its own per-expert
             # sharding
@@ -130,6 +135,7 @@ class NLLBTranslationTask(TranslationTask):
             assert expert_args == self.expert_args, 'cannot update the model with a different expert count per layer'
             model.update_state_dict(expert_params)
             model.load_state_dict(expert_params, strict=False)  # update the model with the new experts
+            # FIXME: this logs "missing keys", disable logging message
             self.prev_expert_ckpt = expert_ckpt
 
     @classmethod

@@ -9,7 +9,7 @@ import argparse
 import logging
 from collections import Counter, defaultdict
 
-from pasero.tokenizers import PaseroTokenizer, build_dict, detokenize, load_vocab, noise
+from pasero.tokenizers import PaseroTokenizer, load_vocab, noise
 from pasero.tokenizers.noise import noisify
 from pasero.preprocessing import _LANG_CODE_PREFIX, split_tags
 
@@ -42,7 +42,7 @@ pasero-noisify: insert random noise
 """
 
 tokenize_parser = argparse.ArgumentParser()
-tokenize_parser.add_argument('bpe_codes', help='path to the BPE model (text file containing the merge operations)')
+tokenize_parser.add_argument('merges', help='path to the BPE model (text file containing the merge operations)')
 tokenize_parser.add_argument('--input', '-i', help="input file (default: standard input)")
 tokenize_parser.add_argument('--output', '-o', help="output file (default: standard output)")
 tokenize_parser.add_argument('--vocabulary', help='path to a vocabulary containing pairs of subwords and corresponding '
@@ -135,21 +135,22 @@ train_parser.add_argument('--max-lines', type=int, default=10000000, help='maxim
 
 
 def main_tokenize():
+    init_logging()
     args = tokenize_parser.parse_args()
     vocab = load_vocab(args.vocabulary, args.threshold) if args.vocabulary else None
-    bpe_model = PaseroTokenizer.read(args.bpe_codes, vocab=vocab)
+    bpe_model = PaseroTokenizer(args.merges, vocab=vocab)
     infile = open(args.input) if args.input else sys.stdin
     outfile = open(args.output, 'w') if args.output else sys.stdout
     try:
-        outfile.writelines(
-            bpe_model.tokenize(line, unk=args.unk, spell_out=args.spell_out, dropout=args.dropout) + '\n'
-            for line in infile
-        )
+        for line in infile:
+            tokens = bpe_model.tokenize(line, unk=args.unk, spell_out=args.spell_out, dropout=args.dropout)
+            outfile.write(' '.join(tokens) + '\n')
     except (KeyboardInterrupt, BrokenPipeError):
         sys.stdout = None   # ugly trick to avoid broken pipe errors
 
 
 def main_build_dict():
+    init_logging()
     args = dict_parser.parse_args()
     infile = open(args.input) if args.input else sys.stdin
     vocab = defaultdict(int)
@@ -173,27 +174,33 @@ def main_build_dict():
         for k in vocab:
             vocab[k] = int(vocab[k] * r)
     vocab = Counter(vocab)
-    build_dict(vocab, **vars(args))
+    PaseroTokenizer.build_dict(vocab, **vars(args))
 
 
 def main_detokenize():
+    init_logging()
     args = detokenize_parser.parse_args()
     infile = open(args.input) if args.input else sys.stdin
     outfile = open(args.output, 'w') if args.output else sys.stdout
     try:
-        outfile.writelines(detokenize(split_tags(line)[-1]) + '\n' for line in infile)
+        for line in infile:
+            *_, line = split_tags(line)
+            tokens = line.split()
+            line = PaseroTokenizer.detokenize(tokens)
+            outfile.write(line + '\n')
     except (KeyboardInterrupt, BrokenPipeError):
         sys.stdout = None
 
 
 def main_noisify():
+    init_logging()
     args = noise_parser.parse_args()
     infile = open(args.input) if args.input else sys.stdin
     outfile = open(args.output, 'w') if args.output else sys.stdout
     noise.seed(args.seed)
     try:
         for line in infile:
-            *tags, line = split_tags(line)
+            *tags, line = split_tags(line.strip())
             line = noisify(line, **vars(args))
             print(*tags, line, file=outfile)
     except (KeyboardInterrupt, BrokenPipeError):
@@ -201,9 +208,10 @@ def main_noisify():
 
 
 def main_train():
+    init_logging()
     args = train_parser.parse_args()
     args.inputs = args.inputs or [None]
-    bpe_model, vocabs = PaseroTokenizer.train(**vars(args))
+    _, vocabs = PaseroTokenizer.train(**vars(args))
 
     args.inputs.sort()
     
@@ -219,7 +227,7 @@ def main_train():
     
     if args.dict_path is not None:
         vocab = sum(vocabs.values(), Counter())
-        build_dict(vocab, **vars(args))
+        PaseroTokenizer.build_dict(vocab, **vars(args))
 
     if args.vocab_path is not None:
         for lang, vocab in vocabs.items():
@@ -228,4 +236,4 @@ def main_train():
             else:
                 vocab_path = f'{args.vocab_path}.{lang}'
             kwargs = {**vars(args), 'dict_path': vocab_path}
-            build_dict(vocabs[lang], **kwargs)
+            PaseroTokenizer.build_dict(vocabs[lang], **kwargs)

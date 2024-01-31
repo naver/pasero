@@ -128,7 +128,7 @@ pip install --upgrade git+https://github.com/microsoft/tutel@main
 # Decode from French and German into English
 
 pasero-decode models/NLLB-200/54B_moe.bin --task nllb_translation \
---expert-ckpt models/NLLB-200/experts/*.bin \
+--expert-ckpt models/NLLB-200/experts/{encoder,decoder}-*-expert-*.bin \
 -e data/FLORES/FLORES-valid \
 -l fra_Latn-eng_Latn deu_Latn-eng_Latn \
 -o "outputs/FLORES-valid.{pair}.out" \
@@ -141,7 +141,7 @@ Decoding with 64 experts is possible on 4 V100s, with similar performance:
 
 ```bash
 pasero-decode models/NLLB-200/54B_moe.bin --task nllb_translation \
---expert-ckpt models/NLLB-200/experts/*-{0-63}.bin \
+--expert-ckpt models/NLLB-200/experts/{encoder,decoder}-*-expert-{0..63}.bin \
 -e data/FLORES/FLORES-valid \
 -l fra_Latn-eng_Latn deu_Latn-eng_Latn \
 -o "outputs/FLORES-valid.{pair}.out" \
@@ -152,7 +152,7 @@ pasero-decode models/NLLB-200/54B_moe.bin --task nllb_translation \
 Or use the `--encoder-decoder-swapping` option, which halves the GPU memory usage (at the cost of much higher RAM usage), by moving the encoder to the CPU once it has finished its job and only then move the decoder to the GPU:
 ```bash
 pasero-decode models/NLLB-200/54B_moe.bin --task nllb_translation \
---expert-ckpt models/NLLB-200/experts/*.bin \
+--expert-ckpt models/NLLB-200/experts/{encoder,decoder}-*-expert-*.bin \
 -e data/FLORES/FLORES-valid \
 -l fra_Latn-eng_Latn deu_Latn-eng_Latn \
 -o "outputs/FLORES-valid.{pair}.out" \

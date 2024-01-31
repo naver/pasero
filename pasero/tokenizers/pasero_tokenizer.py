@@ -15,7 +15,7 @@ import io
 import multiprocessing
 import numpy as np
 from collections import Counter, defaultdict
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Optional, Union
 from .noise import mask
 
 
@@ -29,12 +29,11 @@ def inline_case_to_cased(tokens: list[str]) -> list[str]:
             tokens[i - 1] = tokens[i - 1].title()
         elif w == '<U>':
             tokens[i - 1] = tokens[i - 1].upper()
-    tokens = [w for w in tokens if w not in ('<T>', '<U>')]
-    return tokens
+    return [w for w in tokens if w not in ('<T>', '<U>')]
 
 
-def detokenize(x: str, strip: bool = True) -> str:
-    tokens = inline_case_to_cased(x.split())
+def detokenize(tokens: list[str], strip: bool = True) -> str:
+    tokens = inline_case_to_cased(tokens)
     x = ' '.join(w for w in tokens if w != '</s>')
     x = x.replace(' ', '').replace('▁', ' ')
     return x.strip() if strip else x
@@ -159,33 +158,47 @@ class PaseroTokenizer:
     """
     This is a modified version of subword-nmt (https://github.com/rsennrich/subword-nmt)
     """
-    def __init__(self, bpecodes, vocab=None, inline_case=True, nfkc=False, protect_regex=None, **_):
-        self.bpecodes = {code: i for i, code in reversed(list(enumerate(bpecodes)))}
-        self.bpecodes_reverse = {a + b: (a, b) for a, b in self.bpecodes}
-        self.vocab = set(vocab) if vocab else None
+    def __init__(
+        self,
+        path_or_merges: Union[str, list[tuple[str, str]]],
+        vocab: Optional[list[str]] = None,
+        inline_case: bool = True,
+        nfkc: bool = False,
+        protect_regex: Optional[str] = None,
+        **kwargs,
+    ):
+        config = dict(kwargs)
 
+        if isinstance(path_or_merges, str):
+            with open(path_or_merges) as bpe_file:
+                first_line = next(bpe_file)
+                if first_line.startswith('#'):
+                    try:
+                        config = json.loads(first_line.strip('# \n\r'))
+                    except:
+                        pass
+                else:
+                    bpe_file = itertools.chain([first_line], bpe_file)
+            
+                merges = [tuple(line.rstrip('\r\n').rsplit(' ', maxsplit=1)) for line in bpe_file]
+        else:
+            merges = list(path_or_merges)
+        
         self.inline_case = inline_case
         self.nfkc = nfkc
-        self.protect_regex = None if protect_regex is None else regex.compile(protect_regex)
+        self.protect_regex = protect_regex
 
+        for key in 'inline_case', 'protect_regex', 'nfkc':
+            if key in config:
+                setattr(self, key, config[key])
+
+        self.merges = {code: i for i, code in reversed(list(enumerate(merges)))}
+        self.merges_reverse = {a + b: (a, b) for a, b in self.merges}
+        self.vocab = set(vocab) if vocab else None
+        if self.protect_regex is not None:
+            self.protect_regex = regex.compile(self.protect_regex)
         self.cache = {}
         self.chars = None
-
-    @classmethod
-    def read(cls, bpe_path, **kwargs):
-        with open(bpe_path) as bpe_file:
-            config = {}
-            first_line = next(bpe_file)
-            if first_line.startswith('#'):
-                try:
-                    config = json.loads(first_line.strip('# \n\r'))
-                except:
-                    pass
-            else:
-                bpe_file = itertools.chain([first_line], bpe_file)
-        
-            bpecodes = [tuple(line.rstrip('\r\n').rsplit(' ', maxsplit=1)) for line in bpe_file]
-            return cls(bpecodes, **{**kwargs, **config})
 
     @classmethod
     def train(cls, inputs, output=None, num_symbols=8000, verbose=False, threads=None, existing_bpe_path=False,
@@ -214,10 +227,10 @@ class PaseroTokenizer:
         }
         
         if existing_bpe_path:
-            bpe_model = cls.read(existing_bpe_path)
-            bpecodes = list(reversed(bpe_model.bpecodes))
+            bpe_model = cls(existing_bpe_path)
+            merges = list(reversed(bpe_model.merges))
         else:
-            bpecodes = []
+            merges = []
 
         if output is None:
             outfile = sys.stdout
@@ -242,7 +255,7 @@ class PaseroTokenizer:
             return stats[pair], pair
 
         while not existing_bpe_path:
-            i = len(bpecodes)
+            i = len(merges)
             if i >= num_symbols:
                 break
 
@@ -266,7 +279,7 @@ class PaseroTokenizer:
                     most_frequent[1], stats[most_frequent]))
 
             print(*most_frequent, file=outfile)
-            bpecodes.append(most_frequent)
+            merges.append(most_frequent)
 
             cls._update_pair_statistics(most_frequent, sorted_vocab, stats, indices)
             stats[most_frequent] = 0
@@ -278,7 +291,7 @@ class PaseroTokenizer:
             logger.info(f'finished building the BPE model in {bpe_time}s')
         start = time.time()
 
-        bpe_model = cls(bpecodes)
+        bpe_model = cls(merges)
         # encode the vocabularies with the BPE model. The result can be used to generate a dictionary that maps
         # existing tokens to their frequency
         pool = multiprocessing.Pool(processes=threads) if threads is None or threads > 1 else None
@@ -313,20 +326,32 @@ class PaseroTokenizer:
         return vocab
 
     def __len__(self):
-        return len(self.bpecodes)
+        return len(self.merges)
 
-    def tokenize(self, sentence, unk=None, dropout=0.0, spell_out=0.0):
-        sentence = self._tokenize(sentence, unk=unk, dropout=dropout, spell_out=spell_out)
-        if sentence.startswith('▁ '):
+    def tokenize(
+        self,
+        sentence: str,
+        unk: Optional[str] = None,
+        dropout: float = 0.0,
+        spell_out: float = 0.0,
+    ) -> list[str]:
+        tokens = self._tokenize(sentence, unk=unk, dropout=dropout, spell_out=spell_out)
+        if tokens and tokens[0] == '▁':
             # a lone meta symbol at the beginning of a sentence serves no purpose
-            sentence = sentence[2:]
-        return sentence
+            tokens.pop(0)
+        return tokens
 
-    def _tokenize(self, sentence, unk=None, dropout=0.0, spell_out=0.0):
+    def _tokenize(
+        self,
+        sentence: str,
+        unk: Optional[str] = None,
+        dropout: float = 0.0,
+        spell_out: float = 0.0,
+    ) -> list[str]:
         sentence = sentence.strip()
 
         if not sentence:
-            return sentence
+            return []
 
         if self.nfkc:
             sentence = unicodedata.normalize('NFKC', sentence)
@@ -397,11 +422,10 @@ class PaseroTokenizer:
         sentence = sentence.replace(_MASK_SYMBOL, mask)
         sentence = sentence.replace(_PHL_SYMBOL, '<PHL>')
 
+        tokens = sentence.split()
         if unk is not None and self.vocab:
-            tokens = (w if w in self.vocab else unk.replace('{token}', w) for w in sentence.split())
-            sentence = ' '.join(filter(None, tokens))
-
-        return sentence
+            tokens = [w if w in self.vocab else unk.replace('{token}', w) for w in tokens]
+        return tokens
 
     def _add_factor(self, token, case):
         if self.inline_case:
@@ -414,7 +438,7 @@ class PaseroTokenizer:
         word = list(word)
 
         while len(word) > 1:
-            pairs = list(dict.fromkeys(pair for pair in zip(word, word[1:]) if pair in self.bpecodes))
+            pairs = list(dict.fromkeys(pair for pair in zip(word, word[1:]) if pair in self.merges))
             # using dict instead of set, because set has a non-deterministic order
 
             if dropout:
@@ -423,8 +447,8 @@ class PaseroTokenizer:
             if not pairs:
                 break
 
-            bigram = min(pairs, key=lambda pair: self.bpecodes.get(pair, float('inf')))
-            if bigram not in self.bpecodes:
+            bigram = min(pairs, key=lambda pair: self.merges.get(pair, float('inf')))
+            if bigram not in self.merges:
                 break
             left, right = bigram
 
@@ -448,10 +472,10 @@ class PaseroTokenizer:
         return [x for item in word for x in self._recursive_split(item)]
 
     def _recursive_split(self, segment):
-        if self.vocab is None or segment in self.vocab or segment not in self.bpecodes_reverse:
+        if self.vocab is None or segment in self.vocab or segment not in self.merges_reverse:
             yield segment
         else:
-            for item in self.bpecodes_reverse[segment]:
+            for item in self.merges_reverse[segment]:
                 yield from self._recursive_split(item)
 
     def _encode_word_cached(self, word, dropout=0.0, spell_out=0.0):
@@ -766,8 +790,8 @@ class PaseroTokenizer:
                     big_stats[item] = freq
 
     @staticmethod
-    def detokenize(line):
-        return detokenize(line)
+    def detokenize(tokens: list[str]) -> str:
+        return detokenize(tokens)
 
     def detokenize_on_the_fly(self, tokens: Iterable[str]) -> Iterator[tuple[str, list[str]]]:
         prev_tokens = []
@@ -775,8 +799,66 @@ class PaseroTokenizer:
             if not token:
                 continue
             if prev_tokens and token[0] == '▁':
-                yield detokenize(' '.join(prev_tokens), strip=False), prev_tokens
+                yield detokenize(prev_tokens, strip=False), prev_tokens
                 prev_tokens = []
             prev_tokens.append(token)
         if prev_tokens:
-            yield detokenize(' '.join(prev_tokens), strip=False), prev_tokens
+            yield detokenize(prev_tokens, strip=False), prev_tokens
+
+    @staticmethod
+    def build_dict(
+        vocab, dict_path=None, dict_custom_symbols=[], dict_placeholders=0, dict_padding_offset=4,
+        dict_padding_factor=8, dict_min_freq=10, dict_max_size=None, **_,
+    ):
+        """
+        Used to create a Pasero dictionary from a list of tokens.
+        """
+        dictionary = dict.fromkeys(['<T>', '<U>', '<BT>', '<PHL>', mask], 0)
+        
+        if not isinstance(vocab, dict):  # vocab can be a list or set
+            vocab = dict.fromkeys(vocab, 0)
+
+        vocab = dict(vocab)    # convert Counter to dict (because Counter's update has a different behavior)
+        # count all characters and add missing characters to the dictionary
+        chars = defaultdict(int)
+        for word, count in vocab.items():
+            if word not in dictionary:   # do not spell out special tokens
+                for char in word:
+                    chars[char] += count
+        vocab.update(chars)   # unexpected behavior with Counter
+        vocab = {w: c for w, c in vocab.items() if not c or c >= dict_min_freq}
+        vocab = sorted(vocab.items(), key=lambda p: (-p[1], p[0]))  # sort by count, then alphabetically
+        dictionary.update(dict(vocab))
+        
+        special_symbols = []
+        for token in sorted(dict_custom_symbols):
+            if token not in dictionary:
+                special_symbols.append((token, 0))
+
+        i = 0
+        for _ in range(dict_placeholders):
+            special_symbols.append((f'madeupword{i:04}', 0))
+            i += 1
+
+        dictionary = list(dictionary.items())
+
+        if dict_max_size is not None:
+            assert len(special_symbols) < dict_max_size
+            dictionary = dictionary[:dict_max_size - len(special_symbols)]
+        
+        dictionary += special_symbols
+
+        while (len(dictionary) + dict_padding_offset) % dict_padding_factor != 0:
+            dictionary.append((f'madeupword{i:04}', 0))
+            i += 1
+
+        if dict_path is not None:
+            if dict_path == '-':
+                dict_file = sys.stdout
+            else:
+                dirname = os.path.dirname(dict_path)
+                if dirname:
+                    os.makedirs(dirname, exist_ok=True)
+                dict_file = open(dict_path, 'w')
+            dict_file.writelines(f'{token} {count}\n' for token, count in dictionary)
+        return dictionary

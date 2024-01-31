@@ -26,8 +26,6 @@ from pasero.config import DistributedConfig, TrackerConfig
 
 
 T = TypeVar('T')  # generic type
-SpecialTokens = namedtuple('SpecialTokens', ['padding_idx', 'eos_idx', 'bos_idx', 'unk_idx', 'sep_idx'])
-
 
 logger = logging.getLogger('utils')
 
@@ -59,8 +57,11 @@ def is_distributed(cfg: DistributedConfig) -> bool:
 
 def read_stdin(rank=0, world_size=1, interactive=False) -> Iterator[str]:
     if interactive:
-        import readline   # when imported, modifies the behavior of input() to interpret special character sequences
-        # (e.g., arrow keys)
+        try:
+            import readline   # when imported, modifies the behavior of input() to interpret special character sequences
+            # (e.g., arrow keys)
+        except:
+            traceback.print_exc()
     while True:
         line = [None]
         if rank > 0:  # only master reads from stdin and then broadcasts the line
@@ -707,14 +708,12 @@ def move_to_cpu(obj: T) -> T:
 
 def tokens_as_tensor(
     token_list: list[np.ndarray],
-    special_tokens: SpecialTokens,
-    shift: bool = False,
+    padding_idx: int,
     dtype: torch.dtype = None,
 ) -> tuple[Tensor, LongTensor]:
     """
     Args:
         token_list: list of numpy arrays defining sequences (of ids or features)
-        special_tokens: named tuple defining the ids of the special tokens (eos_idx, bos_idx, padding_idx, etc.)
         shift: whether to shift each sequence one position to the right (and put `bos_idx` as the first token)
         dtype: convert float tensors to this data type
     
@@ -725,16 +724,12 @@ def tokens_as_tensor(
     token_list = [torch.as_tensor(tokens) for tokens in token_list]
     
     if token_list[0].is_floating_point():
-        assert not shift
         tokens = pad_sequence(token_list, batch_first=True, padding_value=0.0)
         tokens = tokens.to(dtype)
     elif token_list[0].dtype is torch.bool:
         tokens = pad_sequence(token_list, batch_first=True, padding_value=False).bool()
     else:
-        if shift:
-            bos = torch.tensor([special_tokens.bos_idx])
-            token_list = [torch.cat([bos, tokens[:-1]]) for tokens in token_list]
-        tokens = pad_sequence(token_list, batch_first=True, padding_value=special_tokens.padding_idx)
+        tokens = pad_sequence(token_list, batch_first=True, padding_value=padding_idx)
         tokens = tokens.long()
 
     lengths = torch.LongTensor(list(map(len, token_list)))
@@ -1193,7 +1188,6 @@ def safe_symlink(src: str, dst: str):
 def safe_delete(path: Optional[str]):
     """
     Delete a file without causing an error if the file doesn't exist.
-    Doesn't delete the file if a symlink to this file exists in the same directory
     """
     if path is None:
         return
