@@ -1,0 +1,37 @@
+arch: llama_7b
+task: dialogue
+chat_template: llama-2
+ckpt: models/llama-2-7b/model_best.bin
+tokenizer: hf
+tokenizer_path: models/tower-7b
+prompt_loss: 0.0  # the loss of the source tokens will be ignored
+max_output_len: 512
+decoder_max_len: 2048
+beam_size: 1 # greedy decoding at evaluation
+repeat_penalty: 1.2
+batch_size: 8192
+max_steps: 1000
+keep_interval: 200
+valid_interval: 200
+save_interval: 200
+label_smoothing: 0
+dropout: 0
+weight_decay: 0.1
+adam_betas: [0.9, 0.95]
+lr: 0.00001
+min_lr: 0.000001
+warmup: 0
+virtual_dp_size: 10 # accumulate gradients over 10 batches before updating model weights
+tp_size: 2 # tensor parallelism over 2 gpus (each tensor split between 2 gpus)
+checkpoint_activations: True # recompute activations on backward pass (saves memory, but makes training a litle slower) -- maybe with 7b model it's actually not needed....?
+dtype: bfloat16
+buffer_size: 1000
+
+data_dir: data
+
+train_corpora: [dolly.en.jsonl]
+valid_corpora: [alpacaeval_test_subset.en.jsonl,
+                alpacaeval_test_subset.fr.jsonl,
+                alpacaeval_test_subset.pt.jsonl,
+                alpacaeval_test_subset.ru.jsonl]
+
