@@ -1,0 +1,14 @@
+### AlpacaEval license information
+
+AlpacaEval dataset is distributed under Creative Commons Attribution Non Commercial 4.0 license: https://spdx.org/licenses/CC-BY-NC-4.0.
+
+Source of data: https://huggingface.co/datasets/tatsu-lab/alpaca_eval
+
+### Note on changes
+Files `alpacaeval_[test|valid]_subset.en.jsonl' contain selected subsets of examples from the original AlpacaEval dataset, without reference responses.
+
+Files `alpacaeval_[test|valid]_subset.fr.jsonl', `alpacaeval_[test|valid]_subset.pt.jsonl', and `alpacaeval_[test|valid]_subset.ru.jsonl' contain selected subsets of examples from the AlpacaEval dataset, without reference responses, translated into French, Postugues, and Russian respectively. Translations were performed using Google translate with manual corrections by native or fluent speakers of respective languages.
+
+File `alpacaeval_modifiers.en.jsonl' contain selected subsets of examples from the original AlpacaEval dataset, without reference responses, with added modifier strings.
+
+Files `alpacaeval_modifiers.fr.jsonl', `alpacaeval_modifiers.pt.jsonl', and `alpacaeval_modifiers.ru.jsonl' contain selected subsets of examples from the original AlpacaEval dataset, without reference responses, with added modifier strings, and translated into French, Postugues, and Russian respectively. Translations were performed using Google translate with manual corrections by native or fluent speakers of respective languages.

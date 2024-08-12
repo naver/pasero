@@ -1,0 +1,9 @@
+### LIMA license information
+
+License information of the LIMA dataset:
+If the source data of LIMA has a stricter license than CC BY-NC-SA, the LIMA dataset follows the same. Otherwise, it follows the CC BY-NC-SA license.
+
+Source of data: https://huggingface.co/datasets/GAIR/lima
+
+### Note on changes
+File `lima.en.jsonl' contains examples from the original LIMA dataset with changed formatting.

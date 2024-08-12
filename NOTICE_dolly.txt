@@ -1,0 +1,14 @@
+### Dolly license information
+
+DOLLY dataset was developed at Databricks (https://www.databricks.com) and its use is subject to the CC BY-SA 3.0 license. See license file at https://spdx.org/licenses/CC-BY-SA-3.0.
+
+Source of data: https://huggingface.co/datasets/databricks/databricks-dolly-15k
+
+Certain categories of material in the dataset include materials from the following sources, licensed under the CC BY-SA 3.0 license:
+
+Wikipedia (various pages) - https://www.wikipedia.org/ Copyright © Wikipedia editors and contributors.
+
+### Note on changes
+File `dolly.en.jsonl' contains examples from the original Dolly dataset with changed formatting.
+
+Files `dolly.fr.jsonl', `dolly.pt.jsonl', and `dolly.ru.jsonl' contain examples from the Dolly dataset translated into French, Postugues, and Russian respectively, using NLLB-200-3.3B model (https://huggingface.co/facebook/nllb-200-3.3B).
