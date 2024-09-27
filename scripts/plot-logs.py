@@ -199,7 +199,7 @@ if args.baseline:
     })
 
 
-lower_is_better = 'loss' in args.metric or 'ppl' in args.metric
+lower_is_better = 'loss' in args.metric or 'ppl' in args.metric or 'wer' in args.metric or 'cer' in args.metric
 
 if args.sort:
     plots.sort(key=lambda d: (min if lower_is_better else max)(d['y']),

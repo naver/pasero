@@ -22,6 +22,8 @@ def log(
 ):
     metrics_ = [
         ('{}', prefix),
+        ('wer {:.2f}', metrics.avg('wer')),
+        ('cer {:.2f}', metrics.avg('cer')),
         ('bleu {:.2f}', metrics.avg('bleu')),
         ('spbleu {:.2f}', metrics.avg('spbleu')),
         ('len_ratio {:.3f}', metrics.avg('len_ratio')),
